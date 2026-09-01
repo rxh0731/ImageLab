@@ -8,7 +8,7 @@ from pathlib import Path
 
 from PIL import Image
 from PySide6.QtCore import QEvent, QPointF, QRectF, QThread, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap, QPolygonF
+from PySide6.QtGui import QColor, QFont, QImage, QKeyEvent, QPainter, QPen, QPixmap, QPolygonF
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -134,8 +134,17 @@ class ImageView(QWidget):
         if not (modifiers & Qt.KeyboardModifier.AltModifier) or self.pixmap.isNull():
             event.ignore()
             return
-        self.zoom_at(event.position(), event.angleDelta().y() or event.pixelDelta().y())
+        self.zoom_at(event.position(), self.wheel_delta(event))
         event.accept()
+
+    @staticmethod
+    def wheel_delta(event) -> int:
+        angle = event.angleDelta()
+        delta = angle.y() or angle.x()
+        if delta == 0:
+            pixel = event.pixelDelta()
+            delta = pixel.y() or pixel.x()
+        return delta
 
     def zoom_at(self, cursor: QPointF, delta: int) -> None:
         if self.pixmap.isNull() or delta == 0:
@@ -269,6 +278,7 @@ class MainWindow(QMainWindow):
         self.result: dict | None = None
         self.worker: ProcessWorker | None = None
         self.import_worker: ImportWorker | None = None
+        self._alt_zoom_held = False
         self._build_ui()
         QApplication.instance().installEventFilter(self)
 
@@ -321,8 +331,12 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(root)
 
     def eventFilter(self, watched, event) -> bool:  # noqa: N802
+        if isinstance(event, QKeyEvent) and event.key() == Qt.Key.Key_Alt and not event.isAutoRepeat():
+            self._alt_zoom_held = event.type() == QEvent.Type.KeyPress
+            return False
         if event.type() == QEvent.Type.Wheel and hasattr(event, "globalPosition"):
-            alt_down = bool(QApplication.keyboardModifiers() & Qt.KeyboardModifier.AltModifier)
+            alt_down = bool(QApplication.queryKeyboardModifiers() & Qt.KeyboardModifier.AltModifier)
+            alt_down = alt_down or self._alt_zoom_held
             if sys.platform == "win32":
                 alt_down = alt_down or bool(ctypes.windll.user32.GetAsyncKeyState(0x12) & 0x8000)
             if alt_down:
@@ -330,9 +344,10 @@ class MainWindow(QMainWindow):
                 for view in (self.original_view, self.cleaned_view):
                     local_pos = view.mapFromGlobal(global_pos)
                     if view.rect().contains(local_pos) and not view.pixmap.isNull():
-                        delta = event.angleDelta().y() or event.pixelDelta().y()
+                        delta = ImageView.wheel_delta(event)
                         view.zoom_at(QPointF(local_pos), delta)
-                        return True
+                        if delta:
+                            return True
         return super().eventFilter(watched, event)
 
     def _build_left_panel(self) -> QWidget:
