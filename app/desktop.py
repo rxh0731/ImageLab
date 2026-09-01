@@ -254,15 +254,33 @@ class ImageLoadWorker(QThread):
         self.source = source
 
     def run(self) -> None:
+        qt_error = ""
         try:
             reader = QImageReader(str(self.source))
             reader.setAutoTransform(True)
             image = reader.read()
+            if not image.isNull():
+                self.loaded.emit(image)
+                return
+            qt_error = reader.errorString() or "Qt 无法读取图像数据"
+        except Exception as exc:  # pragma: no cover - surfaced in the UI
+            qt_error = str(exc)
+        # Some large or compressed TIFFs pass canRead() but fail during Qt decode.
+        # Pillow is used as a background fallback and the copied bytes are owned
+        # by QImage, so the signal remains valid after this worker exits.
+        try:
+            with Image.open(self.source) as opened:
+                opened.load()
+                rgb = opened.convert("RGB")
+                width, height = rgb.size
+                raw = rgb.tobytes()
+                image = QImage(raw, width, height, width * 3, QImage.Format.Format_RGB888).copy()
+                rgb.close()
             if image.isNull():
-                raise RuntimeError(reader.errorString() or "未知图像读取错误")
+                raise RuntimeError("备用解码器生成空图像")
             self.loaded.emit(image)
         except Exception as exc:  # pragma: no cover - surfaced in the UI
-            self.failed.emit(str(exc))
+            self.failed.emit(f"Qt: {qt_error}; Pillow: {exc}")
 
 
 class ProcessWorker(QThread):
