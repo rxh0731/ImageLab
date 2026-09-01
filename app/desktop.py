@@ -218,6 +218,33 @@ class ProcessWorker(QThread):
             self.failed.emit(str(exc))
 
 
+class ImportWorker(QThread):
+    completed = Signal(str, str)
+    failed = Signal(str)
+    progress = Signal(int, str)
+
+    def __init__(self, source: Path, destination: Path) -> None:
+        super().__init__()
+        self.source = source
+        self.destination = destination
+
+    def run(self) -> None:
+        try:
+            self.progress.emit(10, "读取图片")
+            with Image.open(self.source) as opened:
+                opened.verify()
+            self.progress.emit(35, "解码图片")
+            with Image.open(self.source) as opened:
+                image = opened.convert("RGB")
+                self.progress.emit(75, "准备预览")
+                self.destination.parent.mkdir(exist_ok=True)
+                image.save(self.destination, format="PNG", optimize=False)
+            self.progress.emit(100, "导入完成")
+            self.completed.emit(str(self.destination), self.source.name)
+        except Exception as exc:  # pragma: no cover - surfaced in the UI
+            self.failed.emit(str(exc))
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -226,6 +253,7 @@ class MainWindow(QMainWindow):
         self.source: Path | None = None
         self.result: dict | None = None
         self.worker: ProcessWorker | None = None
+        self.import_worker: ImportWorker | None = None
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -392,24 +420,28 @@ class MainWindow(QMainWindow):
         if not path:
             return
         source = Path(path)
-        try:
-            with Image.open(source) as image:
-                image.verify()
-        except Exception as exc:
-            QMessageBox.warning(self, "无法导入", f"图片无法读取：{exc}")
-            return
         UPLOADS.mkdir(exist_ok=True)
         destination = UPLOADS / f"{source.stem}_{source.stat().st_size}.png"
-        try:
-            with Image.open(source) as image:
-                image.convert("RGB").save(destination)
-        except Exception as exc:
-            QMessageBox.warning(self, "无法导入", f"图片复制失败：{exc}")
-            return
-        self.source = destination
+        self.import_button.setEnabled(False)
+        self.process_button.setEnabled(False)
+        self.export_button.setEnabled(False)
+        self.progress_bar.setValue(0)
+        self.progress_bar.show()
+        self.status.setText("正在读取图片，请稍候…")
+        self.import_worker = ImportWorker(source, destination)
+        self.import_worker.progress.connect(self.import_progress)
+        self.import_worker.completed.connect(self.import_done)
+        self.import_worker.failed.connect(self.import_failed)
+        self.import_worker.start()
+
+    def import_done(self, destination: str, original_name: str) -> None:
+        self.import_button.setEnabled(True)
+        self.progress_bar.setValue(100)
+        self.progress_bar.hide()
+        self.source = Path(destination)
         self.result = None
-        self.file_label.setText(source.name)
-        self.original_view.set_image(destination)
+        self.file_label.setText(original_name)
+        self.original_view.set_image(self.source)
         self.cleaned_view.pixmap = QPixmap()
         self.cleaned_view.update()
         self.process_button.setEnabled(True)
@@ -418,6 +450,16 @@ class MainWindow(QMainWindow):
         self.region_table.setRowCount(0)
         self.status.setText("图片已导入，请选择参数后开始处理")
         self.step_process.setEnabled(True)
+
+    def import_progress(self, value: int, message: str) -> None:
+        self.progress_bar.setValue(value)
+        self.status.setText(f"{message}（{value}%）")
+
+    def import_failed(self, message: str) -> None:
+        self.import_button.setEnabled(True)
+        self.progress_bar.hide()
+        self.status.setText("图片导入失败")
+        QMessageBox.warning(self, "无法导入", message)
 
     def process(self) -> None:
         if not self.source:
