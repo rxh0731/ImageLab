@@ -1,0 +1,401 @@
+from __future__ import annotations
+
+import shutil
+import sys
+from pathlib import Path
+
+from PIL import Image
+from PySide6.QtCore import QThread, Qt, Signal
+from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap, QPolygonF
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QFileDialog,
+    QFormLayout,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QMainWindow,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QSplitter,
+    QTableWidget,
+    QTableWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
+
+from .processing import process_image
+
+
+ROOT = Path(__file__).resolve().parent.parent
+UPLOADS = ROOT / "uploads"
+OUTPUTS = ROOT / "outputs"
+
+
+class ImageView(QWidget):
+    def __init__(self, title: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.title = title
+        self.pixmap = QPixmap()
+        self.regions: list[dict] = []
+        self.source_size = (1, 1)
+        self.show_regions = False
+        self.selected_region: int | None = None
+        self.setMinimumSize(280, 360)
+        self.setMouseTracking(True)
+
+    def set_image(self, path: Path) -> None:
+        self.pixmap = QPixmap(str(path))
+        if not self.pixmap.isNull():
+            self.source_size = (self.pixmap.width(), self.pixmap.height())
+        self.update()
+
+    def set_regions(self, regions: list[dict]) -> None:
+        self.regions = regions
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("#ebe7dc"))
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        if self.pixmap.isNull():
+            painter.setPen(QColor("#756f62"))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "尚未导入图片")
+            return
+        margin = 18
+        target = self.pixmap.scaled(self.width() - margin * 2, self.height() - margin * 2, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        x = (self.width() - target.width()) // 2
+        y = (self.height() - target.height()) // 2
+        painter.drawPixmap(x, y, target)
+        painter.setPen(QColor("#37342d"))
+        painter.drawText(x + 9, y + 18, self.title)
+        if not self.show_regions:
+            return
+        scale_x = target.width() / self.source_size[0]
+        scale_y = target.height() / self.source_size[1]
+        for region in self.regions[:500]:
+            points = [QPolygonF([Qt.QPointF(x + px * scale_x, y + py * scale_y) for px, py in region["polygon"]])]
+            if not points[0]:
+                continue
+            confidence = region.get("confidence", 100)
+            color = QColor("#b8793e" if confidence < 70 else "#a44a32")
+            if region["id"] == self.selected_region:
+                color = QColor("#2f6f5b")
+            pen = QPen(color, 3 if region["id"] == self.selected_region else 1.5)
+            painter.setPen(pen)
+            painter.setBrush(QColor(color.red(), color.green(), color.blue(), 25))
+            painter.drawPolygon(points[0])
+
+
+class ProcessWorker(QThread):
+    completed = Signal(dict)
+    failed = Signal(str)
+
+    def __init__(self, source: Path, image_type: str, mode: str, keep_faint: bool) -> None:
+        super().__init__()
+        self.source = source
+        self.image_type = image_type
+        self.mode = mode
+        self.keep_faint = keep_faint
+
+    def run(self) -> None:
+        try:
+            job_id = self.source.stem
+            result = process_image(self.source, OUTPUTS / job_id, self.image_type, self.mode, self.keep_faint)
+            result["job_id"] = job_id
+            result["source"] = str(self.source)
+            self.completed.emit(result)
+        except Exception as exc:  # pragma: no cover - surfaced in the UI
+            self.failed.emit(str(exc))
+
+
+class MainWindow(QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("ImageLab · 古文图像净化工作台")
+        self.resize(1360, 820)
+        self.source: Path | None = None
+        self.result: dict | None = None
+        self.worker: ProcessWorker | None = None
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        self.setStyleSheet("""
+            QMainWindow, QWidget { background:#f6f4ed; color:#29271f; font-family:'Microsoft YaHei'; }
+            QFrame#panel { background:#fffefa; border:1px solid #dedbd1; border-radius:7px; }
+            QLabel#title { font-size:20px; font-weight:600; }
+            QLabel#muted { color:#716d61; font-size:12px; }
+            QPushButton { min-height:34px; padding:0 13px; border:1px solid #dedbd1; border-radius:6px; background:#fffefa; }
+            QPushButton:hover { border-color:#a44a32; color:#a44a32; }
+            QPushButton#primary { background:#a44a32; color:white; border-color:#a44a32; font-weight:600; }
+            QComboBox { min-height:34px; border:1px solid #dedbd1; border-radius:5px; padding:0 8px; background:#fffefa; }
+            QCheckBox { spacing:8px; }
+            QTableWidget { background:#fffefa; border:1px solid #dedbd1; gridline-color:#eeeae0; }
+            QHeaderView::section { padding:5px; background:#f0eee6; border:0; color:#716d61; font-size:11px; }
+            QProgressBar { height:7px; border:0; border-radius:3px; background:#e9e6dd; }
+            QProgressBar::chunk { border-radius:3px; background:#3e7662; }
+        """)
+        root = QWidget()
+        outer = QVBoxLayout(root)
+        outer.setContentsMargins(22, 18, 22, 18)
+        outer.setSpacing(14)
+
+        header = QHBoxLayout()
+        title = QLabel("碑文净化工作台")
+        title.setObjectName("title")
+        header.addWidget(title)
+        subtitle = QLabel("保守去背景 · 笔画优先 · 可回溯")
+        subtitle.setObjectName("muted")
+        header.addWidget(subtitle)
+        header.addStretch()
+        self.import_button = QPushButton("＋ 导入图片")
+        self.import_button.clicked.connect(self.import_image)
+        header.addWidget(self.import_button)
+        self.export_button = QPushButton("导出结果")
+        self.export_button.setObjectName("primary")
+        self.export_button.setEnabled(False)
+        self.export_button.clicked.connect(self.export_result)
+        header.addWidget(self.export_button)
+        outer.addLayout(header)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.addWidget(self._build_left_panel())
+        splitter.addWidget(self._build_preview_panel())
+        splitter.addWidget(self._build_right_panel())
+        splitter.setSizes([220, 800, 280])
+        outer.addWidget(splitter, 1)
+        self.setCentralWidget(root)
+
+    def _build_left_panel(self) -> QWidget:
+        panel = QFrame(objectName="panel")
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(14, 16, 14, 16)
+        label = QLabel("当前资料")
+        label.setObjectName("muted")
+        layout.addWidget(label)
+        self.file_label = QLabel("尚未导入图片")
+        self.file_label.setWordWrap(True)
+        layout.addWidget(self.file_label)
+        layout.addSpacing(20)
+        label = QLabel("工作步骤")
+        label.setObjectName("muted")
+        layout.addWidget(label)
+        self.step_process = QPushButton("2 处理")
+        self.step_process.setEnabled(False)
+        self.step_review = QPushButton("3 复核")
+        self.step_review.setEnabled(False)
+        self.step_export = QPushButton("4 导出")
+        self.step_export.setEnabled(False)
+        layout.addWidget(self.step_process)
+        layout.addWidget(self.step_review)
+        layout.addWidget(self.step_export)
+        layout.addStretch()
+        note = QLabel("原图只读\n处理结果按版本保存")
+        note.setObjectName("muted")
+        layout.addWidget(note)
+        return panel
+
+    def _build_preview_panel(self) -> QWidget:
+        panel = QFrame(objectName="panel")
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(16, 16, 16, 16)
+        head = QHBoxLayout()
+        self.preview_title = QLabel("处理预览")
+        self.preview_title.setStyleSheet("font-size:15px;font-weight:600")
+        head.addWidget(self.preview_title)
+        head.addStretch()
+        self.regions_check = QCheckBox("显示文字区域")
+        self.regions_check.toggled.connect(self.toggle_regions)
+        self.regions_check.setEnabled(False)
+        head.addWidget(self.regions_check)
+        layout.addLayout(head)
+        self.preview_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.original_view = ImageView("原图")
+        self.cleaned_view = ImageView("净化结果")
+        self.preview_splitter.addWidget(self.original_view)
+        self.preview_splitter.addWidget(self.cleaned_view)
+        layout.addWidget(self.preview_splitter, 1)
+        self.status = QLabel("请导入图片开始处理")
+        self.status.setObjectName("muted")
+        layout.addWidget(self.status)
+        return panel
+
+    def _build_right_panel(self) -> QWidget:
+        panel = QFrame(objectName="panel")
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(16, 16, 16, 16)
+        heading = QLabel("处理参数")
+        heading.setStyleSheet("font-size:15px;font-weight:600")
+        layout.addWidget(heading)
+        form = QFormLayout()
+        self.type_combo = QComboBox()
+        self.type_combo.addItem("古代碑文拓印", "rubbing")
+        self.type_combo.addItem("古籍扫描", "book")
+        self.type_combo.addItem("古代手稿扫描", "manuscript")
+        self.type_combo.addItem("其他文献图像", "other")
+        form.addRow("资料类型", self.type_combo)
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem("保守保真（推荐）", "conservative")
+        self.mode_combo.addItem("平衡增强", "balanced")
+        self.mode_combo.addItem("强力去杂", "strong")
+        form.addRow("处理模式", self.mode_combo)
+        layout.addLayout(form)
+        self.keep_faint = QCheckBox("保留淡色笔画")
+        self.keep_faint.setChecked(True)
+        layout.addWidget(self.keep_faint)
+        self.detect_cracks = QCheckBox("识别裂纹和污渍")
+        self.detect_cracks.setChecked(True)
+        layout.addWidget(self.detect_cracks)
+        self.ocr_check = QCheckBox("OCR 辅助复核（预留）")
+        self.ocr_check.setEnabled(False)
+        layout.addWidget(self.ocr_check)
+        layout.addSpacing(10)
+        self.process_button = QPushButton("开始处理")
+        self.process_button.setObjectName("primary")
+        self.process_button.setEnabled(False)
+        self.process_button.clicked.connect(self.process)
+        layout.addWidget(self.process_button)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 0)
+        self.progress.hide()
+        layout.addWidget(self.progress)
+        layout.addSpacing(14)
+        note = QLabel("多边形只用于候选区域复核，不会硬切原始笔画。")
+        note.setWordWrap(True)
+        note.setObjectName("muted")
+        layout.addWidget(note)
+        layout.addStretch()
+        self.region_table = QTableWidget(0, 2)
+        self.region_table.setHorizontalHeaderLabels(["区域", "置信度"])
+        self.region_table.setMaximumHeight(210)
+        self.region_table.cellClicked.connect(self.select_region)
+        layout.addWidget(QLabel("低置信度区域"))
+        layout.addWidget(self.region_table)
+        return panel
+
+    def import_image(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "选择文献图片", "", "Images (*.png *.jpg *.jpeg *.tif *.tiff *.bmp *.webp)")
+        if not path:
+            return
+        source = Path(path)
+        try:
+            with Image.open(source) as image:
+                image.verify()
+        except Exception as exc:
+            QMessageBox.warning(self, "无法导入", f"图片无法读取：{exc}")
+            return
+        UPLOADS.mkdir(exist_ok=True)
+        destination = UPLOADS / f"{source.stem}_{source.stat().st_size}.png"
+        try:
+            with Image.open(source) as image:
+                image.convert("RGB").save(destination)
+        except Exception as exc:
+            QMessageBox.warning(self, "无法导入", f"图片复制失败：{exc}")
+            return
+        self.source = destination
+        self.result = None
+        self.file_label.setText(source.name)
+        self.original_view.set_image(destination)
+        self.cleaned_view.pixmap = QPixmap()
+        self.cleaned_view.update()
+        self.process_button.setEnabled(True)
+        self.export_button.setEnabled(False)
+        self.regions_check.setEnabled(False)
+        self.region_table.setRowCount(0)
+        self.status.setText("图片已导入，请选择参数后开始处理")
+        self.step_process.setEnabled(True)
+
+    def process(self) -> None:
+        if not self.source:
+            return
+        self.process_button.setEnabled(False)
+        self.progress.show()
+        self.status.setText("正在处理，请稍候…")
+        self.worker = ProcessWorker(self.source, self.type_combo.currentData(), self.mode_combo.currentData(), self.keep_faint.isChecked())
+        self.worker.completed.connect(self.processing_done)
+        self.worker.failed.connect(self.processing_failed)
+        self.worker.start()
+
+    def processing_done(self, result: dict) -> None:
+        self.result = result
+        self.progress.hide()
+        self.process_button.setEnabled(True)
+        self.export_button.setEnabled(True)
+        self.cleaned_view.set_image(OUTPUTS / result["job_id"] / result["enhanced"])
+        self.cleaned_view.set_regions(result["regions"])
+        self.original_view.set_regions(result["regions"])
+        self.regions_check.setEnabled(bool(result["regions"]))
+        self.status.setText(f"处理完成：{result['width']}×{result['height']}，文字保留置信度 {result['confidence']}%")
+        self.step_review.setEnabled(True)
+        self.populate_regions(result["regions"])
+
+    def processing_failed(self, message: str) -> None:
+        self.progress.hide()
+        self.process_button.setEnabled(True)
+        self.status.setText("处理失败")
+        QMessageBox.critical(self, "处理失败", message)
+
+    def populate_regions(self, regions: list[dict]) -> None:
+        low = [r for r in regions if r.get("confidence", 100) < 70]
+        self.region_table.setRowCount(len(low))
+        for row, region in enumerate(low):
+            self.region_table.setItem(row, 0, QTableWidgetItem(f"区域 {region['id']}"))
+            self.region_table.setItem(row, 1, QTableWidgetItem(f"{region['confidence']}%"))
+
+    def toggle_regions(self, checked: bool) -> None:
+        self.original_view.show_regions = checked
+        self.cleaned_view.show_regions = checked
+        self.original_view.update()
+        self.cleaned_view.update()
+
+    def select_region(self, row: int, column: int) -> None:
+        if not self.result:
+            return
+        low = [r for r in self.result["regions"] if r.get("confidence", 100) < 70]
+        if row >= len(low):
+            return
+        region_id = low[row]["id"]
+        self.original_view.selected_region = region_id
+        self.cleaned_view.selected_region = region_id
+        self.regions_check.setChecked(True)
+        self.status.setText(f"已选中区域 {region_id}，请对照原图确认是否保留")
+        self.original_view.update()
+        self.cleaned_view.update()
+        self.step_review.setEnabled(True)
+
+    def export_result(self) -> None:
+        if not self.result:
+            return
+        files = [
+            ("增强灰度图", self.result["enhanced"]),
+            ("文字候选图", self.result["text_mask"]),
+            ("透明背景 PNG", self.result["transparent"]),
+        ]
+        target_dir = QFileDialog.getExistingDirectory(self, "选择导出目录")
+        if not target_dir:
+            return
+        source_dir = OUTPUTS / self.result["job_id"]
+        for label, name in files:
+            try:
+                shutil.copy2(source_dir / name, Path(target_dir) / name)
+            except OSError as exc:
+                QMessageBox.critical(self, "导出失败", f"{label}导出失败：{exc}")
+                return
+        self.step_export.setEnabled(True)
+        self.status.setText(f"已导出 {len(files)} 个文件到 {target_dir}")
+
+
+def main() -> int:
+    app = QApplication(sys.argv)
+    app.setFont(QFont("Microsoft YaHei", 10))
+    window = MainWindow()
+    window.show()
+    return app.exec()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

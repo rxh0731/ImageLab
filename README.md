@@ -14,7 +14,7 @@ ImageLab 是古代碑文拓印、古籍扫描和古代手稿图像净化的第�
 
 ## 启动
 
-也可以直接双击 `start_imagelab.bat`。脚本会自动准备虚拟环境、安装依赖、启动服务并打开浏览器。
+桌面版推荐直接双击 `start_imagelab_desktop.bat`。脚本会自动准备虚拟环境、安装依赖并打开 ImageLab 桌面窗口。`start_imagelab.bat` 保留为 API/调试用启动方式，不是最终用户入口。
 
 Windows PowerShell：
 
