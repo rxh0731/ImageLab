@@ -5,7 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import cv2
-from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+from PIL import Image, ImageOps
 
 
 @dataclass(frozen=True)
@@ -71,7 +71,19 @@ def _find_text_regions(mask: Image.Image, enhanced: Image.Image) -> list[dict]:
     return regions[:5000]
 
 
-def process_image(source: Path, output_dir: Path, image_type: str, mode: str, keep_faint: bool) -> dict:
+def process_image(
+    source: Path,
+    output_dir: Path,
+    image_type: str,
+    mode: str,
+    keep_faint: bool,
+    progress_callback=None,
+) -> dict:
+    def progress(value: int, message: str) -> None:
+        if progress_callback:
+            progress_callback(value, message)
+
+    progress(5, "读取图片")
     preset = PRESETS.get(image_type, PRESETS["other"])
     if mode == "balanced":
         preset = ProcessingPreset(preset.background_radius, preset.contrast + 0.10, preset.threshold_bias + 2, preset.denoise_radius + 0.2)
@@ -79,16 +91,32 @@ def process_image(source: Path, output_dir: Path, image_type: str, mode: str, ke
         preset = ProcessingPreset(preset.background_radius + 10, preset.contrast + 0.18, preset.threshold_bias + 5, preset.denoise_radius + 0.5)
 
     with Image.open(source) as opened:
+        original_size = opened.size
         original = opened.convert("L").copy()
+    # Interactive desktop processing is capped to keep very large TIFFs responsive.
+    max_dimension = 4096
+    scale = min(1.0, max_dimension / max(original.size))
+    if scale < 1.0:
+        original = original.resize((max(1, int(original.width * scale)), max(1, int(original.height * scale))), Image.Resampling.LANCZOS)
+    progress(18, "规范化亮度")
     normalized = _normalize(original)
-    background = normalized.filter(ImageFilter.GaussianBlur(radius=preset.background_radius))
     norm_arr = np.asarray(normalized, dtype=np.float32)
-    bg_arr = np.asarray(background, dtype=np.float32)
+    height, width = norm_arr.shape
+    # Estimate the low-frequency background on a smaller image, then upsample it.
+    # This is substantially faster than a full-resolution large-radius blur.
+    shrink = max(1, int(round(min(width, height) / 900)))
+    small_size = (max(1, width // shrink), max(1, height // shrink))
+    small = cv2.resize(norm_arr, small_size, interpolation=cv2.INTER_AREA)
+    sigma = max(1.0, preset.background_radius / shrink)
+    background_small = cv2.GaussianBlur(small, (0, 0), sigmaX=sigma, sigmaY=sigma)
+    bg_arr = cv2.resize(background_small, (width, height), interpolation=cv2.INTER_LINEAR)
+    progress(42, "校正背景")
     corrected_arr = np.clip((norm_arr - bg_arr) + 128.0, 0, 255).astype(np.uint8)
-    corrected = Image.fromarray(corrected_arr, mode="L")
     if preset.denoise_radius > 0:
-        corrected = corrected.filter(ImageFilter.GaussianBlur(radius=preset.denoise_radius))
-    enhanced = ImageEnhance.Contrast(corrected).enhance(preset.contrast)
+        corrected_arr = cv2.GaussianBlur(corrected_arr, (0, 0), sigmaX=preset.denoise_radius, sigmaY=preset.denoise_radius)
+    enhanced_arr = np.clip((corrected_arr.astype(np.float32) - 128.0) * preset.contrast + 128.0, 0, 255).astype(np.uint8)
+    enhanced = Image.fromarray(enhanced_arr, mode="L")
+    progress(62, "提取文字候选")
 
     # Preserve faint strokes by using a conservative threshold and keeping the grayscale source.
     threshold = 128 + preset.threshold_bias
@@ -106,7 +134,9 @@ def process_image(source: Path, output_dir: Path, image_type: str, mode: str, ke
     enhanced_path = output_dir / f"{stem}_enhanced.png"
     mask_path = output_dir / f"{stem}_text-mask.png"
     transparent_path = output_dir / f"{stem}_transparent.png"
+    progress(78, "分析文字区域")
     regions = _find_text_regions(text_mask, enhanced)
+    progress(90, "保存结果")
     enhanced.save(enhanced_path)
     text_mask.save(mask_path)
     transparent.save(transparent_path)
@@ -116,6 +146,9 @@ def process_image(source: Path, output_dir: Path, image_type: str, mode: str, ke
         "transparent": transparent_path.name,
         "width": enhanced.width,
         "height": enhanced.height,
+        "original_width": original_size[0],
+        "original_height": original_size[1],
+        "preview_scale": round(scale, 4),
         "confidence": round(min(99.0, 86.0 + (9.0 if keep_faint else 0.0)), 1),
         "regions": regions,
     }

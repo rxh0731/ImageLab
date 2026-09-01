@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 from PIL import Image
-from PySide6.QtCore import QThread, Qt, Signal
+from PySide6.QtCore import QPointF, QThread, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap, QPolygonF
 from PySide6.QtWidgets import (
     QApplication,
@@ -77,7 +77,7 @@ class ImageView(QWidget):
         scale_x = target.width() / self.source_size[0]
         scale_y = target.height() / self.source_size[1]
         for region in self.regions[:500]:
-            points = [QPolygonF([Qt.QPointF(x + px * scale_x, y + py * scale_y) for px, py in region["polygon"]])]
+            points = [QPolygonF([QPointF(x + px * scale_x, y + py * scale_y) for px, py in region["polygon"]])]
             if not points[0]:
                 continue
             confidence = region.get("confidence", 100)
@@ -93,6 +93,7 @@ class ImageView(QWidget):
 class ProcessWorker(QThread):
     completed = Signal(dict)
     failed = Signal(str)
+    progress = Signal(int, str)
 
     def __init__(self, source: Path, image_type: str, mode: str, keep_faint: bool) -> None:
         super().__init__()
@@ -104,7 +105,14 @@ class ProcessWorker(QThread):
     def run(self) -> None:
         try:
             job_id = self.source.stem
-            result = process_image(self.source, OUTPUTS / job_id, self.image_type, self.mode, self.keep_faint)
+            result = process_image(
+                self.source,
+                OUTPUTS / job_id,
+                self.image_type,
+                self.mode,
+                self.keep_faint,
+                progress_callback=lambda value, message: self.progress.emit(value, message),
+            )
             result["job_id"] = job_id
             result["source"] = str(self.source)
             self.completed.emit(result)
@@ -259,10 +267,11 @@ class MainWindow(QMainWindow):
         self.process_button.setEnabled(False)
         self.process_button.clicked.connect(self.process)
         layout.addWidget(self.process_button)
-        self.progress = QProgressBar()
-        self.progress.setRange(0, 0)
-        self.progress.hide()
-        layout.addWidget(self.progress)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.hide()
+        layout.addWidget(self.progress_bar)
         layout.addSpacing(14)
         note = QLabel("多边形只用于候选区域复核，不会硬切原始笔画。")
         note.setWordWrap(True)
@@ -313,16 +322,19 @@ class MainWindow(QMainWindow):
         if not self.source:
             return
         self.process_button.setEnabled(False)
-        self.progress.show()
+        self.progress_bar.setValue(0)
+        self.progress_bar.show()
         self.status.setText("正在处理，请稍候…")
         self.worker = ProcessWorker(self.source, self.type_combo.currentData(), self.mode_combo.currentData(), self.keep_faint.isChecked())
+        self.worker.progress.connect(self.processing_progress)
         self.worker.completed.connect(self.processing_done)
         self.worker.failed.connect(self.processing_failed)
         self.worker.start()
 
     def processing_done(self, result: dict) -> None:
         self.result = result
-        self.progress.hide()
+        self.progress_bar.setValue(100)
+        self.progress_bar.hide()
         self.process_button.setEnabled(True)
         self.export_button.setEnabled(True)
         self.cleaned_view.set_image(OUTPUTS / result["job_id"] / result["enhanced"])
@@ -334,10 +346,14 @@ class MainWindow(QMainWindow):
         self.populate_regions(result["regions"])
 
     def processing_failed(self, message: str) -> None:
-        self.progress.hide()
+        self.progress_bar.hide()
         self.process_button.setEnabled(True)
         self.status.setText("处理失败")
         QMessageBox.critical(self, "处理失败", message)
+
+    def processing_progress(self, value: int, message: str) -> None:
+        self.progress_bar.setValue(value)
+        self.status.setText(f"{message}（{value}%）")
 
     def populate_regions(self, regions: list[dict]) -> None:
         low = [r for r in regions if r.get("confidence", 100) < 70]
