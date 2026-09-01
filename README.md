@@ -15,7 +15,14 @@ ImageLab 是古代碑文拓印、古籍扫描和古代手稿图像净化的第�
 
 ## 启动
 
-桌面版推荐直接双击 `start_imagelab_desktop.bat`。脚本会自动准备虚拟环境、安装依赖并打开 ImageLab 桌面窗口。`start_imagelab.bat` 保留为 API/调试用启动方式，不是最终用户入口。
+桌面版推荐直接双击 `start_imagelab.bat` 或 `start_imagelab_desktop.bat`。两个脚本都会自动准备虚拟环境、安装依赖并打开 ImageLab 桌面窗口；网页入口仅供 API/调试使用。
+
+## 桌面视图操作
+
+- `Alt + 鼠标滚轮`：以光标位置为中心缩放，范围 20%～800%。
+- `空格 + 鼠标左键拖动`：平移画布，光标会变为手型。
+- 按住鼠标中键拖动：直接平移画布。
+- 点击“重置视图”：恢复适合窗口的 100% 视图。
 
 Windows PowerShell：
 

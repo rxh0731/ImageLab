@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 from PIL import Image
-from PySide6.QtCore import QPointF, QThread, Qt, Signal
+from PySide6.QtCore import QPointF, QRectF, QThread, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap, QPolygonF
 from PySide6.QtWidgets import (
     QApplication,
@@ -44,18 +44,46 @@ class ImageView(QWidget):
         self.source_size = (1, 1)
         self.show_regions = False
         self.selected_region: int | None = None
+        self.zoom = 1.0
+        self.pan = QPointF(0, 0)
+        self._panning = False
+        self._last_mouse = QPointF(0, 0)
+        self._space_down = False
         self.setMinimumSize(280, 360)
         self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
     def set_image(self, path: Path) -> None:
         self.pixmap = QPixmap(str(path))
         if not self.pixmap.isNull():
             self.source_size = (self.pixmap.width(), self.pixmap.height())
+        self.reset_view()
         self.update()
 
     def set_regions(self, regions: list[dict]) -> None:
         self.regions = regions
         self.update()
+
+    def reset_view(self) -> None:
+        self.zoom = 1.0
+        self.pan = QPointF(0, 0)
+        self._set_hand_cursor(False)
+        self.update()
+
+    def _set_hand_cursor(self, dragging: bool) -> None:
+        if dragging or self._space_down:
+            self.setCursor(Qt.CursorShape.ClosedHandCursor if dragging else Qt.CursorShape.OpenHandCursor)
+        else:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def _image_rect(self) -> QRectF:
+        if self.pixmap.isNull():
+            return QRectF()
+        margin = 18
+        fitted = self.pixmap.scaled(self.width() - margin * 2, self.height() - margin * 2, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        size = QPointF(fitted.width() * self.zoom, fitted.height() * self.zoom)
+        center = QPointF(self.width() / 2, self.height() / 2) + self.pan
+        return QRectF(center.x() - size.x() / 2, center.y() - size.y() / 2, size.x(), size.y())
 
     def paintEvent(self, event) -> None:  # noqa: N802
         painter = QPainter(self)
@@ -65,17 +93,17 @@ class ImageView(QWidget):
             painter.setPen(QColor("#756f62"))
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "尚未导入图片")
             return
-        margin = 18
-        target = self.pixmap.scaled(self.width() - margin * 2, self.height() - margin * 2, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-        x = (self.width() - target.width()) // 2
-        y = (self.height() - target.height()) // 2
-        painter.drawPixmap(x, y, target)
+        rect = self._image_rect()
+        painter.drawPixmap(rect.toRect(), self.pixmap)
+        x, y = rect.left(), rect.top()
         painter.setPen(QColor("#37342d"))
-        painter.drawText(x + 9, y + 18, self.title)
+        painter.drawText(int(x + 9), int(y + 18), self.title)
         if not self.show_regions:
+            painter.setPen(QColor("#756f62"))
+            painter.drawText(12, self.height() - 12, f"缩放 {round(self.zoom * 100)}% · Alt+滚轮缩放 · 空格+拖动平移")
             return
-        scale_x = target.width() / self.source_size[0]
-        scale_y = target.height() / self.source_size[1]
+        scale_x = rect.width() / self.source_size[0]
+        scale_y = rect.height() / self.source_size[1]
         for region in self.regions[:500]:
             points = [QPolygonF([QPointF(x + px * scale_x, y + py * scale_y) for px, py in region["polygon"]])]
             if not points[0]:
@@ -88,6 +116,70 @@ class ImageView(QWidget):
             painter.setPen(pen)
             painter.setBrush(QColor(color.red(), color.green(), color.blue(), 25))
             painter.drawPolygon(points[0])
+        painter.setPen(QColor("#756f62"))
+        painter.drawText(12, self.height() - 12, f"缩放 {round(self.zoom * 100)}% · Alt+滚轮缩放 · 空格+拖动平移")
+
+    def wheelEvent(self, event) -> None:  # noqa: N802
+        if not (event.modifiers() & Qt.KeyboardModifier.AltModifier) or self.pixmap.isNull():
+            event.ignore()
+            return
+        old_rect = self._image_rect()
+        cursor = event.position()
+        if old_rect.width() <= 0 or old_rect.height() <= 0:
+            return
+        ux = (cursor.x() - old_rect.left()) / old_rect.width()
+        uy = (cursor.y() - old_rect.top()) / old_rect.height()
+        factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
+        self.zoom = max(0.2, min(8.0, self.zoom * factor))
+        new_rect = self._image_rect()
+        desired_top_left = QPointF(cursor.x() - ux * new_rect.width(), cursor.y() - uy * new_rect.height())
+        self.pan += desired_top_left - new_rect.topLeft()
+        self.update()
+        event.accept()
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        self.setFocus(Qt.FocusReason.MouseFocusReason)
+        if event.button() == Qt.MouseButton.MiddleButton or (event.button() == Qt.MouseButton.LeftButton and self._space_down):
+            self._panning = True
+            self._last_mouse = event.position()
+            self._set_hand_cursor(True)
+            event.accept()
+            return
+        event.ignore()
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if self._panning:
+            delta = event.position() - self._last_mouse
+            self.pan += delta
+            self._last_mouse = event.position()
+            self.update()
+            event.accept()
+            return
+        event.ignore()
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if self._panning and event.button() in (Qt.MouseButton.LeftButton, Qt.MouseButton.MiddleButton):
+            self._panning = False
+            self._set_hand_cursor(False)
+            event.accept()
+            return
+        event.ignore()
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        if event.key() == Qt.Key.Key_Space and not event.isAutoRepeat():
+            self._space_down = True
+            self._set_hand_cursor(False)
+            event.accept()
+            return
+        event.ignore()
+
+    def keyReleaseEvent(self, event) -> None:  # noqa: N802
+        if event.key() == Qt.Key.Key_Space and not event.isAutoRepeat():
+            self._space_down = False
+            self._set_hand_cursor(False)
+            event.accept()
+            return
+        event.ignore()
 
 
 class ProcessWorker(QThread):
@@ -216,6 +308,9 @@ class MainWindow(QMainWindow):
         self.preview_title.setStyleSheet("font-size:15px;font-weight:600")
         head.addWidget(self.preview_title)
         head.addStretch()
+        self.reset_view_button = QPushButton("重置视图")
+        self.reset_view_button.clicked.connect(self.reset_views)
+        head.addWidget(self.reset_view_button)
         self.regions_check = QCheckBox("显示文字区域")
         self.regions_check.toggled.connect(self.toggle_regions)
         self.regions_check.setEnabled(False)
@@ -367,6 +462,10 @@ class MainWindow(QMainWindow):
         self.cleaned_view.show_regions = checked
         self.original_view.update()
         self.cleaned_view.update()
+
+    def reset_views(self) -> None:
+        self.original_view.reset_view()
+        self.cleaned_view.reset_view()
 
     def select_region(self, row: int, column: int) -> None:
         if not self.result:
