@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import shutil
 import sys
+import ctypes
 from math import ceil
 from pathlib import Path
 
 from PIL import Image
-from PySide6.QtCore import QPointF, QRectF, QThread, Qt, Signal
+from PySide6.QtCore import QEvent, QPointF, QRectF, QThread, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap, QPolygonF
 from PySide6.QtWidgets import (
     QApplication,
@@ -128,6 +129,8 @@ class ImageView(QWidget):
     def wheelEvent(self, event) -> None:  # noqa: N802
         # Windows may omit Alt from the native wheel event while it is still held.
         modifiers = event.modifiers() | QApplication.keyboardModifiers()
+        if sys.platform == "win32" and ctypes.windll.user32.GetAsyncKeyState(0x12) & 0x8000:
+            modifiers |= Qt.KeyboardModifier.AltModifier
         if not (modifiers & Qt.KeyboardModifier.AltModifier) or self.pixmap.isNull():
             event.ignore()
             return
@@ -267,6 +270,7 @@ class MainWindow(QMainWindow):
         self.worker: ProcessWorker | None = None
         self.import_worker: ImportWorker | None = None
         self._build_ui()
+        QApplication.instance().installEventFilter(self)
 
     def _build_ui(self) -> None:
         self.setStyleSheet("""
@@ -315,6 +319,21 @@ class MainWindow(QMainWindow):
         splitter.setSizes([220, 800, 280])
         outer.addWidget(splitter, 1)
         self.setCentralWidget(root)
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802
+        if event.type() == QEvent.Type.Wheel and hasattr(event, "globalPosition"):
+            alt_down = bool(QApplication.keyboardModifiers() & Qt.KeyboardModifier.AltModifier)
+            if sys.platform == "win32":
+                alt_down = alt_down or bool(ctypes.windll.user32.GetAsyncKeyState(0x12) & 0x8000)
+            if alt_down:
+                global_pos = event.globalPosition().toPoint()
+                for view in (self.original_view, self.cleaned_view):
+                    local_pos = view.mapFromGlobal(global_pos)
+                    if view.rect().contains(local_pos) and not view.pixmap.isNull():
+                        delta = event.angleDelta().y() or event.pixelDelta().y()
+                        view.zoom_at(QPointF(local_pos), delta)
+                        return True
+        return super().eventFilter(watched, event)
 
     def _build_left_panel(self) -> QWidget:
         panel = QFrame(objectName="panel")
