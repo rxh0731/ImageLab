@@ -123,13 +123,19 @@ class ImageView(QWidget):
         if not (event.modifiers() & Qt.KeyboardModifier.AltModifier) or self.pixmap.isNull():
             event.ignore()
             return
+        delta = event.angleDelta().y()
+        if delta == 0:
+            delta = event.pixelDelta().y()
+        if delta == 0:
+            event.ignore()
+            return
         old_rect = self._image_rect()
         cursor = event.position()
         if old_rect.width() <= 0 or old_rect.height() <= 0:
             return
         ux = (cursor.x() - old_rect.left()) / old_rect.width()
         uy = (cursor.y() - old_rect.top()) / old_rect.height()
-        factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
+        factor = 1.15 if delta > 0 else 1 / 1.15
         self.zoom = max(0.2, min(8.0, self.zoom * factor))
         new_rect = self._image_rect()
         desired_top_left = QPointF(cursor.x() - ux * new_rect.width(), cursor.y() - uy * new_rect.height())
