@@ -120,17 +120,18 @@ class ImageView(QWidget):
         painter.drawText(12, self.height() - 12, f"缩放 {round(self.zoom * 100)}% · Alt+滚轮缩放 · 空格+拖动平移")
 
     def wheelEvent(self, event) -> None:  # noqa: N802
-        if not (event.modifiers() & Qt.KeyboardModifier.AltModifier) or self.pixmap.isNull():
+        # Windows may omit Alt from the native wheel event while it is still held.
+        modifiers = event.modifiers() | QApplication.keyboardModifiers()
+        if not (modifiers & Qt.KeyboardModifier.AltModifier) or self.pixmap.isNull():
             event.ignore()
             return
-        delta = event.angleDelta().y()
-        if delta == 0:
-            delta = event.pixelDelta().y()
-        if delta == 0:
-            event.ignore()
+        self.zoom_at(event.position(), event.angleDelta().y() or event.pixelDelta().y())
+        event.accept()
+
+    def zoom_at(self, cursor: QPointF, delta: int) -> None:
+        if self.pixmap.isNull() or delta == 0:
             return
         old_rect = self._image_rect()
-        cursor = event.position()
         if old_rect.width() <= 0 or old_rect.height() <= 0:
             return
         ux = (cursor.x() - old_rect.left()) / old_rect.width()
@@ -141,7 +142,6 @@ class ImageView(QWidget):
         desired_top_left = QPointF(cursor.x() - ux * new_rect.width(), cursor.y() - uy * new_rect.height())
         self.pan += desired_top_left - new_rect.topLeft()
         self.update()
-        event.accept()
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
         self.setFocus(Qt.FocusReason.MouseFocusReason)
