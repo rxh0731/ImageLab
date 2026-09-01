@@ -25,17 +25,20 @@ PRESETS = {
 
 
 def _normalize(gray: Image.Image) -> Image.Image:
-    arr = np.asarray(gray, dtype=np.float32)
+    arr = np.asarray(gray, dtype=np.uint8)
     low, high = np.percentile(arr, (1, 99))
     if high <= low:
         return gray.convert("L")
-    out = np.clip((arr - low) * 255.0 / (high - low), 0, 255).astype(np.uint8)
+    out = cv2.convertScaleAbs(arr, alpha=255.0 / (high - low), beta=-low * 255.0 / (high - low))
     return Image.fromarray(out, mode="L")
 
 
-def _find_text_regions(mask: Image.Image, enhanced: Image.Image) -> list[dict]:
+def _find_text_regions(mask: Image.Image, enhanced: Image.Image, max_size: int = 2400) -> list[dict]:
     """Return editable candidate regions; never use these polygons to hard-crop pixels."""
-    binary = np.asarray(mask, dtype=np.uint8)
+    full_width, full_height = mask.size
+    scale = min(1.0, max_size / max(full_width, full_height))
+    analysis_size = (max(1, int(full_width * scale)), max(1, int(full_height * scale)))
+    binary = np.asarray(mask.resize(analysis_size, Image.Resampling.BOX), dtype=np.uint8)
     ink = np.where(binary < 128, 255, 0).astype(np.uint8)
     height, width = ink.shape
     kernel_size = max(1, int(round(min(width, height) / 1400)))
@@ -43,7 +46,7 @@ def _find_text_regions(mask: Image.Image, enhanced: Image.Image) -> list[dict]:
         kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
         ink = cv2.morphologyEx(ink, cv2.MORPH_OPEN, kernel)
     contours, _ = cv2.findContours(ink, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    gray = np.asarray(enhanced, dtype=np.uint8)
+    gray = np.asarray(enhanced.resize(analysis_size, Image.Resampling.BOX), dtype=np.uint8)
     min_area = max(12, int(width * height * 0.000002))
     regions: list[dict] = []
     for contour in contours:
@@ -61,8 +64,8 @@ def _find_text_regions(mask: Image.Image, enhanced: Image.Image) -> list[dict]:
         confidence = round(float(np.clip(55 + mean_darkness * 0.55, 55, 99)), 1)
         regions.append({
             "id": len(regions) + 1,
-            "polygon": [[int(px), int(py)] for px, py in polygon],
-            "bbox": [int(x), int(y), int(w), int(h)],
+            "polygon": [[int(round(px / scale)), int(round(py / scale))] for px, py in polygon],
+            "bbox": [int(round(x / scale)), int(round(y / scale)), int(round(w / scale)), int(round(h / scale))],
             "confidence": confidence,
         })
     regions.sort(key=lambda item: (item["bbox"][1], item["bbox"][0]))
@@ -93,14 +96,10 @@ def process_image(
     with Image.open(source) as opened:
         original_size = opened.size
         original = opened.convert("L").copy()
-    # Interactive desktop processing is capped to keep very large TIFFs responsive.
-    max_dimension = 4096
-    scale = min(1.0, max_dimension / max(original.size))
-    if scale < 1.0:
-        original = original.resize((max(1, int(original.width * scale)), max(1, int(original.height * scale))), Image.Resampling.LANCZOS)
+    scale = 1.0
     progress(18, "规范化亮度")
     normalized = _normalize(original)
-    norm_arr = np.asarray(normalized, dtype=np.float32)
+    norm_arr = np.asarray(normalized, dtype=np.uint8)
     height, width = norm_arr.shape
     # Estimate the low-frequency background on a smaller image, then upsample it.
     # This is substantially faster than a full-resolution large-radius blur.
@@ -109,19 +108,19 @@ def process_image(
     small = cv2.resize(norm_arr, small_size, interpolation=cv2.INTER_AREA)
     sigma = max(1.0, preset.background_radius / shrink)
     background_small = cv2.GaussianBlur(small, (0, 0), sigmaX=sigma, sigmaY=sigma)
-    bg_arr = cv2.resize(background_small, (width, height), interpolation=cv2.INTER_LINEAR)
+    bg_arr = cv2.resize(background_small.astype(np.uint8), (width, height), interpolation=cv2.INTER_LINEAR)
     progress(42, "校正背景")
     # Divide by the estimated background so uneven paper/stone tone becomes a
     # white field. A floor prevents dark stains from amplifying sensor noise.
-    bg_safe = np.maximum(bg_arr, 32.0)
-    corrected_arr = np.clip((norm_arr / bg_safe) * 255.0, 0, 255).astype(np.uint8)
+    bg_safe = np.maximum(bg_arr, 32).astype(np.uint8)
+    corrected_arr = cv2.divide(norm_arr, bg_safe, scale=255.0, dtype=cv2.CV_8U)
     # Keep the brightest background samples at white while retaining dark ink.
     background_level = float(np.percentile(corrected_arr, 98.5))
     if background_level > 1:
-        corrected_arr = np.clip(corrected_arr.astype(np.float32) * (255.0 / background_level), 0, 255).astype(np.uint8)
+        corrected_arr = cv2.convertScaleAbs(corrected_arr, alpha=255.0 / background_level)
     if preset.denoise_radius > 0:
         corrected_arr = cv2.GaussianBlur(corrected_arr, (0, 0), sigmaX=preset.denoise_radius, sigmaY=preset.denoise_radius)
-    enhanced_arr = np.clip((corrected_arr.astype(np.float32) - 128.0) * preset.contrast + 128.0, 0, 255).astype(np.uint8)
+    enhanced_arr = cv2.convertScaleAbs(corrected_arr, alpha=preset.contrast, beta=128.0 * (1.0 - preset.contrast))
     enhanced = Image.fromarray(enhanced_arr, mode="L")
     progress(62, "提取文字候选")
 
@@ -141,16 +140,22 @@ def process_image(
     enhanced_path = output_dir / f"{stem}_enhanced.png"
     mask_path = output_dir / f"{stem}_text-mask.png"
     transparent_path = output_dir / f"{stem}_transparent.png"
+    preview_path = output_dir / f"{stem}_enhanced_preview.jpg"
     progress(78, "分析文字区域")
     regions = _find_text_regions(text_mask, enhanced)
     progress(90, "保存结果")
     enhanced.save(enhanced_path)
     text_mask.save(mask_path)
     transparent.save(transparent_path)
+    preview = enhanced.copy()
+    preview.thumbnail((2400, 2400), Image.Resampling.LANCZOS)
+    preview.save(preview_path, format="JPEG", quality=90, optimize=True)
+    preview.close()
     return {
         "enhanced": enhanced_path.name,
         "text_mask": mask_path.name,
         "transparent": transparent_path.name,
+        "enhanced_preview": preview_path.name,
         "width": enhanced.width,
         "height": enhanced.height,
         "original_width": original_size[0],

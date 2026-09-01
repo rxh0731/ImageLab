@@ -608,7 +608,10 @@ class MainWindow(QMainWindow):
         self.progress_bar.hide()
         self.process_button.setEnabled(True)
         self.export_button.setEnabled(True)
-        self.cleaned_view.set_image(OUTPUTS / result["job_id"] / result["enhanced"])
+        output_dir = OUTPUTS / result["job_id"]
+        cleaned_preview = output_dir / result.get("enhanced_preview", result["enhanced"])
+        cleaned_full = output_dir / result["enhanced"]
+        self.cleaned_view.set_image(cleaned_preview, high_res_source=cleaned_full)
         self.cleaned_view.set_regions(result["regions"])
         self.original_view.set_coordinate_size(result["width"], result["height"])
         self.original_view.set_regions(result["regions"])
