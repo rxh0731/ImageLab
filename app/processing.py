@@ -111,7 +111,14 @@ def process_image(
     background_small = cv2.GaussianBlur(small, (0, 0), sigmaX=sigma, sigmaY=sigma)
     bg_arr = cv2.resize(background_small, (width, height), interpolation=cv2.INTER_LINEAR)
     progress(42, "校正背景")
-    corrected_arr = np.clip((norm_arr - bg_arr) + 128.0, 0, 255).astype(np.uint8)
+    # Divide by the estimated background so uneven paper/stone tone becomes a
+    # white field. A floor prevents dark stains from amplifying sensor noise.
+    bg_safe = np.maximum(bg_arr, 32.0)
+    corrected_arr = np.clip((norm_arr / bg_safe) * 255.0, 0, 255).astype(np.uint8)
+    # Keep the brightest background samples at white while retaining dark ink.
+    background_level = float(np.percentile(corrected_arr, 98.5))
+    if background_level > 1:
+        corrected_arr = np.clip(corrected_arr.astype(np.float32) * (255.0 / background_level), 0, 255).astype(np.uint8)
     if preset.denoise_radius > 0:
         corrected_arr = cv2.GaussianBlur(corrected_arr, (0, 0), sigmaX=preset.denoise_radius, sigmaY=preset.denoise_radius)
     enhanced_arr = np.clip((corrected_arr.astype(np.float32) - 128.0) * preset.contrast + 128.0, 0, 255).astype(np.uint8)

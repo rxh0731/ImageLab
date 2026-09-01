@@ -475,7 +475,7 @@ class MainWindow(QMainWindow):
         layout.addLayout(head)
         self.preview_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.original_view = ImageView("原图")
-        self.cleaned_view = ImageView("净化结果")
+        self.cleaned_view = ImageView("白底净化结果")
         self.original_view.high_res_status.connect(self.status_message)
         self.preview_splitter.addWidget(self.original_view)
         self.preview_splitter.addWidget(self.cleaned_view)
