@@ -8,7 +8,7 @@ from pathlib import Path
 
 from PIL import Image
 from PySide6.QtCore import QEvent, QPointF, QRectF, QThread, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QImage, QKeyEvent, QPainter, QPen, QPixmap, QPolygonF
+from PySide6.QtGui import QColor, QFont, QImage, QImageReader, QKeyEvent, QPainter, QPen, QPixmap, QPolygonF
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -38,12 +38,15 @@ OUTPUTS = ROOT / "outputs"
 
 
 class ImageView(QWidget):
+    high_res_status = Signal(str)
+
     def __init__(self, title: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.title = title
         self.pixmap = QPixmap()
         self.regions: list[dict] = []
         self.source_size = (1, 1)
+        self.region_size = (1, 1)
         self.show_regions = False
         self.selected_region: int | None = None
         self.zoom = 1.0
@@ -51,15 +54,22 @@ class ImageView(QWidget):
         self._panning = False
         self._last_mouse = QPointF(0, 0)
         self._space_down = False
+        self._high_res_source: Path | None = None
+        self._high_res_loader: ImageLoadWorker | None = None
+        self._high_res_requested = False
         self.setMinimumSize(280, 360)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
-    def set_image(self, path: Path) -> None:
+    def set_image(self, path: Path, high_res_source: Path | None = None) -> None:
         image = QImage(str(path))
         self.pixmap = QPixmap.fromImage(image) if not image.isNull() else QPixmap()
         if not self.pixmap.isNull():
             self.source_size = (self.pixmap.width(), self.pixmap.height())
+            self.region_size = self.source_size
+        self._high_res_source = high_res_source
+        self._high_res_requested = False
+        self._high_res_loader = None
         self.reset_view()
         self.update()
 
@@ -68,8 +78,35 @@ class ImageView(QWidget):
         self.update()
 
     def set_coordinate_size(self, width: int, height: int) -> None:
-        self.source_size = (max(1, width), max(1, height))
+        self.region_size = (max(1, width), max(1, height))
         self.update()
+
+    def request_high_res(self) -> None:
+        if self._high_res_source is None or self._high_res_requested or self._high_res_loader is not None:
+            return
+        if not self._high_res_source.exists():
+            return
+        self._high_res_requested = True
+        self.high_res_status.emit("正在异步载入高清原图…")
+        self._high_res_loader = ImageLoadWorker(self._high_res_source)
+        self._high_res_loader.loaded.connect(self._high_res_loaded)
+        self._high_res_loader.failed.connect(self._high_res_failed)
+        self._high_res_loader.start()
+
+    def _high_res_loaded(self, image: QImage) -> None:
+        pixmap = QPixmap.fromImage(image)
+        if pixmap.isNull():
+            self._high_res_failed("高清原图无法创建显示缓存")
+            return
+        self.pixmap = pixmap
+        self.source_size = (pixmap.width(), pixmap.height())
+        self.high_res_status.emit(f"高清原图已载入（{pixmap.width()}×{pixmap.height()}）")
+        self.update()
+        self._high_res_loader = None
+
+    def _high_res_failed(self, message: str) -> None:
+        self._high_res_loader = None
+        self.high_res_status.emit(f"高清原图载入失败，继续使用预览图：{message}")
 
     def reset_view(self) -> None:
         self.zoom = 1.0
@@ -109,8 +146,8 @@ class ImageView(QWidget):
             painter.setPen(QColor("#756f62"))
             painter.drawText(12, self.height() - 12, f"缩放 {round(self.zoom * 100)}% · Alt+滚轮缩放 · 空格+拖动平移")
             return
-        scale_x = rect.width() / self.source_size[0]
-        scale_y = rect.height() / self.source_size[1]
+        scale_x = rect.width() / self.region_size[0]
+        scale_y = rect.height() / self.region_size[1]
         for region in self.regions[:500]:
             points = [QPolygonF([QPointF(x + px * scale_x, y + py * scale_y) for px, py in region["polygon"]])]
             if not points[0]:
@@ -149,13 +186,15 @@ class ImageView(QWidget):
     def zoom_at(self, cursor: QPointF, delta: int) -> None:
         if self.pixmap.isNull() or delta == 0:
             return
+        if delta > 0:
+            self.request_high_res()
         old_rect = self._image_rect()
         if old_rect.width() <= 0 or old_rect.height() <= 0:
             return
         ux = (cursor.x() - old_rect.left()) / old_rect.width()
         uy = (cursor.y() - old_rect.top()) / old_rect.height()
         factor = 1.15 if delta > 0 else 1 / 1.15
-        self.zoom = max(0.2, min(8.0, self.zoom * factor))
+        self.zoom = max(0.08, self.zoom * factor)
         new_rect = self._image_rect()
         desired_top_left = QPointF(cursor.x() - ux * new_rect.width(), cursor.y() - uy * new_rect.height())
         self.pan += desired_top_left - new_rect.topLeft()
@@ -204,6 +243,26 @@ class ImageView(QWidget):
             event.accept()
             return
         event.ignore()
+
+
+class ImageLoadWorker(QThread):
+    loaded = Signal(QImage)
+    failed = Signal(str)
+
+    def __init__(self, source: Path) -> None:
+        super().__init__()
+        self.source = source
+
+    def run(self) -> None:
+        try:
+            reader = QImageReader(str(self.source))
+            reader.setAutoTransform(True)
+            image = reader.read()
+            if image.isNull():
+                raise RuntimeError(reader.errorString() or "未知图像读取错误")
+            self.loaded.emit(image)
+        except Exception as exc:  # pragma: no cover - surfaced in the UI
+            self.failed.emit(str(exc))
 
 
 class ProcessWorker(QThread):
@@ -399,6 +458,7 @@ class MainWindow(QMainWindow):
         self.preview_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.original_view = ImageView("原图")
         self.cleaned_view = ImageView("净化结果")
+        self.original_view.high_res_status.connect(self.status_message)
         self.preview_splitter.addWidget(self.original_view)
         self.preview_splitter.addWidget(self.cleaned_view)
         layout.addWidget(self.preview_splitter, 1)
@@ -488,7 +548,7 @@ class MainWindow(QMainWindow):
         self.preview_source = Path(preview)
         self.result = None
         self.file_label.setText(original_name)
-        self.original_view.set_image(self.preview_source)
+        self.original_view.set_image(self.preview_source, high_res_source=self.source)
         self.cleaned_view.pixmap = QPixmap()
         self.cleaned_view.update()
         self.process_button.setEnabled(True)
@@ -501,6 +561,9 @@ class MainWindow(QMainWindow):
     def import_progress(self, value: int, message: str) -> None:
         self.progress_bar.setValue(value)
         self.status.setText(f"{message}（{value}%）")
+
+    def status_message(self, message: str) -> None:
+        self.status.setText(message)
 
     def import_failed(self, message: str) -> None:
         self.import_button.setEnabled(True)
