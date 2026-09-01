@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 import sys
+from math import ceil
 from pathlib import Path
 
 from PIL import Image
@@ -54,7 +55,8 @@ class ImageView(QWidget):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
     def set_image(self, path: Path) -> None:
-        self.pixmap = QPixmap(str(path))
+        image = QImage(str(path))
+        self.pixmap = QPixmap.fromImage(image) if not image.isNull() else QPixmap()
         if not self.pixmap.isNull():
             self.source_size = (self.pixmap.width(), self.pixmap.height())
         self.reset_view()
@@ -62,6 +64,10 @@ class ImageView(QWidget):
 
     def set_regions(self, regions: list[dict]) -> None:
         self.regions = regions
+        self.update()
+
+    def set_coordinate_size(self, width: int, height: int) -> None:
+        self.source_size = (max(1, width), max(1, height))
         self.update()
 
     def reset_view(self) -> None:
@@ -219,7 +225,7 @@ class ProcessWorker(QThread):
 
 
 class ImportWorker(QThread):
-    completed = Signal(str, str)
+    completed = Signal(str, str, str, int, int)
     failed = Signal(str)
     progress = Signal(int, str)
 
@@ -232,15 +238,20 @@ class ImportWorker(QThread):
         try:
             self.progress.emit(10, "读取图片")
             with Image.open(self.source) as opened:
-                opened.verify()
-            self.progress.emit(35, "解码图片")
-            with Image.open(self.source) as opened:
-                image = opened.convert("RGB")
+                width, height = opened.size
+                self.progress.emit(25, "保存原始文件")
+                shutil.copy2(self.source, self.destination)
+                self.progress.emit(45, "生成预览")
+                reduce_factor = max(1, ceil(max(width, height) / 2400))
+                preview = opened.reduce(reduce_factor) if reduce_factor > 1 else opened.copy()
+                preview = preview.convert("RGB")
                 self.progress.emit(75, "准备预览")
                 self.destination.parent.mkdir(exist_ok=True)
-                image.save(self.destination, format="PNG", optimize=False)
+                preview_path = self.destination.with_name(f"{self.destination.stem}_preview.jpg")
+                preview.save(preview_path, format="JPEG", quality=88, optimize=True)
+                preview.close()
             self.progress.emit(100, "导入完成")
-            self.completed.emit(str(self.destination), self.source.name)
+            self.completed.emit(str(self.destination), str(preview_path), self.source.name, width, height)
         except Exception as exc:  # pragma: no cover - surfaced in the UI
             self.failed.emit(str(exc))
 
@@ -251,6 +262,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("ImageLab · 古文图像净化工作台")
         self.resize(1360, 820)
         self.source: Path | None = None
+        self.preview_source: Path | None = None
         self.result: dict | None = None
         self.worker: ProcessWorker | None = None
         self.import_worker: ImportWorker | None = None
@@ -421,7 +433,7 @@ class MainWindow(QMainWindow):
             return
         source = Path(path)
         UPLOADS.mkdir(exist_ok=True)
-        destination = UPLOADS / f"{source.stem}_{source.stat().st_size}.png"
+        destination = UPLOADS / f"{source.stem}_{source.stat().st_size}{source.suffix.lower()}"
         self.import_button.setEnabled(False)
         self.process_button.setEnabled(False)
         self.export_button.setEnabled(False)
@@ -434,14 +446,15 @@ class MainWindow(QMainWindow):
         self.import_worker.failed.connect(self.import_failed)
         self.import_worker.start()
 
-    def import_done(self, destination: str, original_name: str) -> None:
+    def import_done(self, destination: str, preview: str, original_name: str, width: int, height: int) -> None:
         self.import_button.setEnabled(True)
         self.progress_bar.setValue(100)
         self.progress_bar.hide()
         self.source = Path(destination)
+        self.preview_source = Path(preview)
         self.result = None
         self.file_label.setText(original_name)
-        self.original_view.set_image(self.source)
+        self.original_view.set_image(self.preview_source)
         self.cleaned_view.pixmap = QPixmap()
         self.cleaned_view.update()
         self.process_button.setEnabled(True)
@@ -482,6 +495,7 @@ class MainWindow(QMainWindow):
         self.export_button.setEnabled(True)
         self.cleaned_view.set_image(OUTPUTS / result["job_id"] / result["enhanced"])
         self.cleaned_view.set_regions(result["regions"])
+        self.original_view.set_coordinate_size(result["width"], result["height"])
         self.original_view.set_regions(result["regions"])
         self.regions_check.setEnabled(bool(result["regions"]))
         self.status.setText(f"处理完成：{result['width']}×{result['height']}，文字保留置信度 {result['confidence']}%")
