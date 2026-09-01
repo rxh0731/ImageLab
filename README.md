@@ -10,6 +10,7 @@ ImageLab 是古代碑文拓印、古籍扫描和古代手稿图像净化的第�
 - 轻度平滑和局部对比度增强
 - 增强灰度图、文字候选图、透明背景 PNG 输出
 - 原图/结果对照预览与参数调节
+- 文字候选多边形区域和低置信度复核入口
 
 ## 启动
 
@@ -36,3 +37,10 @@ outputs/           运行时结果目录
 ```
 
 后续可在 `app/processing.py` 中增加 SegFormer/U-Net++ 推理，并保留当前处理器作为无模型回退路径。
+
+## API
+
+- `GET /api/health`：服务健康检查
+- `POST /api/process`：上传图片并生成处理结果
+
+`/api/process` 接收 `file`、`image_type`（`rubbing`、`book`、`manuscript`、`other`）、`mode`（`conservative`、`balanced`、`strong`）和 `keep_faint` 字段，返回结果文件地址、尺寸、总体置信度以及文字候选多边形。多边形只用于显示和复核，不能替代底层像素掩膜。

@@ -20,6 +20,7 @@ UPLOADS.mkdir(exist_ok=True)
 OUTPUTS.mkdir(exist_ok=True)
 
 app = FastAPI(title="ImageLab", version="0.1.0")
+app.mount("/uploads", StaticFiles(directory=UPLOADS), name="uploads")
 app.mount("/outputs", StaticFiles(directory=OUTPUTS), name="outputs")
 
 
@@ -46,10 +47,16 @@ async def process(
     try:
         result = process_image(source, OUTPUTS / job_id, image_type, mode, keep_faint)
     except Exception as exc:
-        source.unlink(missing_ok=True)
+        try:
+            source.unlink(missing_ok=True)
+        except PermissionError:
+            # The processing layer normally closes the image before returning.
+            # Keep the API response useful even if a decoder retains a handle.
+            pass
         raise HTTPException(status_code=422, detail=f"图片处理失败：{exc}") from exc
     result["job_id"] = job_id
     result["original"] = source.name
+    result["original_url"] = f"/uploads/{source.name}"
     result["output_base"] = f"/outputs/{job_id}/"
     (OUTPUTS / job_id / "result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     return result
@@ -58,4 +65,3 @@ async def process(
 @app.get("/")
 def index() -> FileResponse:
     return FileResponse(FRONTEND / "index.html")
-

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+import cv2
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
 
@@ -32,14 +33,53 @@ def _normalize(gray: Image.Image) -> Image.Image:
     return Image.fromarray(out, mode="L")
 
 
-def process_image(source: Path, output_dir: Path, image_type: str, mode: str, keep_faint: bool) -> dict[str, str | int | float]:
+def _find_text_regions(mask: Image.Image, enhanced: Image.Image) -> list[dict]:
+    """Return editable candidate regions; never use these polygons to hard-crop pixels."""
+    binary = np.asarray(mask, dtype=np.uint8)
+    ink = np.where(binary < 128, 255, 0).astype(np.uint8)
+    height, width = ink.shape
+    kernel_size = max(1, int(round(min(width, height) / 1400)))
+    if kernel_size > 1:
+        kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+        ink = cv2.morphologyEx(ink, cv2.MORPH_OPEN, kernel)
+    contours, _ = cv2.findContours(ink, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    gray = np.asarray(enhanced, dtype=np.uint8)
+    min_area = max(12, int(width * height * 0.000002))
+    regions: list[dict] = []
+    for contour in contours:
+        area = float(cv2.contourArea(contour))
+        x, y, w, h = cv2.boundingRect(contour)
+        if area < min_area or w < 3 or h < 3:
+            continue
+        perimeter = cv2.arcLength(contour, True)
+        polygon = cv2.approxPolyDP(contour, max(1.0, perimeter * 0.02), True).reshape(-1, 2)
+        if len(polygon) < 3:
+            continue
+        region_mask = np.zeros_like(ink)
+        cv2.drawContours(region_mask, [contour], -1, 255, -1)
+        mean_darkness = float(255 - gray[region_mask > 0].mean()) if np.any(region_mask) else 0.0
+        confidence = round(float(np.clip(55 + mean_darkness * 0.55, 55, 99)), 1)
+        regions.append({
+            "id": len(regions) + 1,
+            "polygon": [[int(px), int(py)] for px, py in polygon],
+            "bbox": [int(x), int(y), int(w), int(h)],
+            "confidence": confidence,
+        })
+    regions.sort(key=lambda item: (item["bbox"][1], item["bbox"][0]))
+    for index, region in enumerate(regions, start=1):
+        region["id"] = index
+    return regions[:5000]
+
+
+def process_image(source: Path, output_dir: Path, image_type: str, mode: str, keep_faint: bool) -> dict:
     preset = PRESETS.get(image_type, PRESETS["other"])
     if mode == "balanced":
         preset = ProcessingPreset(preset.background_radius, preset.contrast + 0.10, preset.threshold_bias + 2, preset.denoise_radius + 0.2)
     elif mode == "strong":
         preset = ProcessingPreset(preset.background_radius + 10, preset.contrast + 0.18, preset.threshold_bias + 5, preset.denoise_radius + 0.5)
 
-    original = Image.open(source).convert("L")
+    with Image.open(source) as opened:
+        original = opened.convert("L").copy()
     normalized = _normalize(original)
     background = normalized.filter(ImageFilter.GaussianBlur(radius=preset.background_radius))
     norm_arr = np.asarray(normalized, dtype=np.float32)
@@ -66,6 +106,7 @@ def process_image(source: Path, output_dir: Path, image_type: str, mode: str, ke
     enhanced_path = output_dir / f"{stem}_enhanced.png"
     mask_path = output_dir / f"{stem}_text-mask.png"
     transparent_path = output_dir / f"{stem}_transparent.png"
+    regions = _find_text_regions(text_mask, enhanced)
     enhanced.save(enhanced_path)
     text_mask.save(mask_path)
     transparent.save(transparent_path)
@@ -76,4 +117,5 @@ def process_image(source: Path, output_dir: Path, image_type: str, mode: str, ke
         "width": enhanced.width,
         "height": enhanced.height,
         "confidence": round(min(99.0, 86.0 + (9.0 if keep_faint else 0.0)), 1),
+        "regions": regions,
     }
