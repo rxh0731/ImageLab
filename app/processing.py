@@ -106,6 +106,19 @@ def _clean_ink_mask(mask_arr: np.ndarray, width: int, height: int, mode: str) ->
     return keep
 
 
+def _stroke_edge_band(ink_mask: np.ndarray, enhanced_arr: np.ndarray, threshold: int, mode: str) -> np.ndarray:
+    """Keep antialiased pixels immediately around retained strokes."""
+    if mode == "conservative":
+        return ink_mask
+    # Do not let white-background cleanup cut through the antialiased fringe.
+    # A 3x3 band is resolution-independent and avoids adding visible halos.
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    band = cv2.dilate(ink_mask, kernel, iterations=1)
+    edge_limit = min(245, max(threshold + 56, 180))
+    edge_pixels = enhanced_arr <= edge_limit
+    return np.where((ink_mask > 0) | ((band > 0) & edge_pixels), 255, 0).astype(np.uint8)
+
+
 def process_image(
     source: Path,
     output_dir: Path,
@@ -171,16 +184,22 @@ def process_image(
         threshold += 4
     raw_mask = np.where(mask_arr < threshold, 35, 255).astype(np.uint8)
     ink_mask = _clean_ink_mask(raw_mask, width, height, mode)
+    display_mask = _stroke_edge_band(ink_mask, enhanced_arr, threshold, mode)
     # In balanced/strong modes, make the displayed enhancement a true white
     # background image. Keep grayscale values only where ink was retained.
     if mode in {"balanced", "strong"}:
-        cleaned_display = np.where(ink_mask > 0, enhanced_arr, 255).astype(np.uint8)
+        cleaned_display = np.where(display_mask > 0, enhanced_arr, 255).astype(np.uint8)
     else:
         cleaned_display = enhanced_arr
     enhanced = Image.fromarray(cleaned_display, mode="L")
-    text_arr = np.where(ink_mask > 0, 35, 255).astype(np.uint8)
+    text_arr = np.where(display_mask > 0, 35, 255).astype(np.uint8)
     text_mask = Image.fromarray(text_arr, mode="L")
-    alpha = ImageOps.invert(text_mask)
+    # Use a grayscale alpha fringe so antialiased stroke edges remain smooth.
+    if mode in {"balanced", "strong"}:
+        alpha_arr = np.where(display_mask > 0, np.clip(255 - enhanced_arr, 0, 255), 0).astype(np.uint8)
+        alpha = Image.fromarray(alpha_arr, mode="L")
+    else:
+        alpha = ImageOps.invert(text_mask)
     transparent = Image.new("RGBA", enhanced.size, (38, 34, 26, 0))
     transparent.putalpha(alpha)
 
