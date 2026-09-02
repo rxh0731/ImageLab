@@ -143,6 +143,7 @@ def process_image(
         with Image.open(source) as opened:
             original_size = opened.size
             original = opened.convert("L").copy()
+    source_arr = np.asarray(original, dtype=np.uint8).copy()
     scale = 1.0
     progress(18, "规范化亮度")
     normalized = _normalize(original)
@@ -187,21 +188,21 @@ def process_image(
     display_mask = _stroke_edge_band(ink_mask, enhanced_arr, threshold, mode)
     # In balanced/strong modes, make the displayed enhancement a true white
     # background image. Keep grayscale values only where ink was retained.
-    if mode in {"balanced", "strong"}:
-        cleaned_display = np.where(display_mask > 0, enhanced_arr, 255).astype(np.uint8)
-    else:
-        cleaned_display = enhanced_arr
+    # The final white-background output must not alter any selected stroke
+    # pixels. Copy the source grayscale byte-for-byte inside the conservative
+    # text mask and change only pixels outside that mask to white.
+    cleaned_display = np.where(display_mask > 0, source_arr, 255).astype(np.uint8)
     enhanced = Image.fromarray(cleaned_display, mode="L")
     text_arr = np.where(display_mask > 0, 35, 255).astype(np.uint8)
     text_mask = Image.fromarray(text_arr, mode="L")
     # Use a grayscale alpha fringe so antialiased stroke edges remain smooth.
     if mode in {"balanced", "strong"}:
-        alpha_arr = np.where(display_mask > 0, np.clip(255 - enhanced_arr, 0, 255), 0).astype(np.uint8)
+        alpha_arr = np.where(display_mask > 0, np.clip(255 - source_arr, 0, 255), 0).astype(np.uint8)
         alpha = Image.fromarray(alpha_arr, mode="L")
     else:
         alpha = ImageOps.invert(text_mask)
-    transparent = Image.new("RGBA", enhanced.size, (38, 34, 26, 0))
-    transparent.putalpha(alpha)
+    source_rgba = Image.merge("RGBA", (original, original, original, alpha))
+    transparent = source_rgba
 
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = source.stem
