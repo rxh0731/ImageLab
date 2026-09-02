@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import warnings
 
 import numpy as np
 import cv2
@@ -93,9 +94,11 @@ def process_image(
     elif mode == "strong":
         preset = ProcessingPreset(preset.background_radius + 10, preset.contrast + 0.18, preset.threshold_bias + 5, preset.denoise_radius + 0.5)
 
-    with Image.open(source) as opened:
-        original_size = opened.size
-        original = opened.convert("L").copy()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+        with Image.open(source) as opened:
+            original_size = opened.size
+            original = opened.convert("L").copy()
     scale = 1.0
     progress(18, "规范化亮度")
     normalized = _normalize(original)
