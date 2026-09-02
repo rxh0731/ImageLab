@@ -80,6 +80,12 @@ def _clean_ink_mask(mask_arr: np.ndarray, width: int, height: int, mode: str) ->
     ink = np.where(mask_arr < 128, 255, 0).astype(np.uint8)
     if mode == "conservative":
         return ink
+    if mode == "balanced":
+        # A small detached stroke can be a legitimate calligraphic component
+        # (for example the dot in "時"). Do not run connected-component
+        # pruning in the balanced preset: every thresholded source pixel is
+        # eligible for source-pixel passthrough below.
+        return ink
     # Analyze huge masks at a bounded working size, then map the keep mask back
     # to the original grid. Final output pixels remain full resolution.
     analysis_scale = min(1.0, 3200.0 / max(width, height))
@@ -111,10 +117,13 @@ def _stroke_edge_band(ink_mask: np.ndarray, enhanced_arr: np.ndarray, threshold:
     if mode == "conservative":
         return ink_mask
     # Do not let white-background cleanup cut through the antialiased fringe.
-    # A 3x3 band is resolution-independent and avoids adding visible halos.
-    kernel = np.ones((3, 3), dtype=np.uint8)
+    # Balanced mode is deliberately wider because its priority is preserving
+    # the exact source stroke edge, including faint pixels between samples.
+    radius = 2 if mode == "balanced" else 1
+    kernel_size = radius * 2 + 1
+    kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
     band = cv2.dilate(ink_mask, kernel, iterations=1)
-    edge_limit = min(245, max(threshold + 56, 180))
+    edge_limit = min(235, max(threshold + (64 if mode == "balanced" else 56), 190))
     edge_pixels = enhanced_arr <= edge_limit
     return np.where((ink_mask > 0) | ((band > 0) & edge_pixels), 255, 0).astype(np.uint8)
 
@@ -180,7 +189,9 @@ def process_image(
     if keep_faint:
         threshold -= 9
     if mode == "balanced":
-        threshold += 10
+        # Keep a wider candidate range so pale antialiased parts and small
+        # detached dots remain source-pixel passthrough candidates.
+        threshold += 24
     elif mode == "strong":
         threshold += 4
     raw_mask = np.where(mask_arr < threshold, 35, 255).astype(np.uint8)
