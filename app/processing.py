@@ -106,6 +106,25 @@ def _clean_ink_mask(mask_arr: np.ndarray, width: int, height: int, mode: str) ->
         for index in range(1, count):
             if int(stats[index, cv2.CC_STAT_AREA]) >= min_core_area:
                 keep[labels == index] = 255
+        # At very large source sizes, a 3200px analysis level can reduce
+        # legitimate character strokes to one-pixel lines. If the thickness
+        # pass would discard nearly everything, retain connected candidates
+        # instead of returning an almost blank page.
+        ink_area = int(np.count_nonzero(ink))
+        keep_area = int(np.count_nonzero(keep))
+        if ink_area and keep_area < ink_area * 0.25:
+            count, labels, stats, _ = cv2.connectedComponentsWithStats(ink, connectivity=8)
+            min_candidate_area = max(20, int(ink.shape[0] * ink.shape[1] * 0.0000002))
+            keep = np.zeros_like(ink)
+            for index in range(1, count):
+                area = int(stats[index, cv2.CC_STAT_AREA])
+                component_width = int(stats[index, cv2.CC_STAT_WIDTH])
+                component_height = int(stats[index, cv2.CC_STAT_HEIGHT])
+                if area >= min_candidate_area or (
+                    max(component_width, component_height) >= 20
+                    and area >= max(3, min_candidate_area // 4)
+                ):
+                    keep[labels == index] = 255
         if analysis_scale < 1.0:
             keep = cv2.resize(keep, (width, height), interpolation=cv2.INTER_NEAREST)
         return keep
