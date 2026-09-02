@@ -3,12 +3,13 @@ from __future__ import annotations
 import shutil
 import sys
 import ctypes
+import warnings
 from math import ceil
 from pathlib import Path
 
 from PIL import Image
 from PySide6.QtCore import QEvent, QPointF, QRectF, QThread, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QImage, QImageReader, QKeyEvent, QPainter, QPen, QPixmap, QPolygonF
+from PySide6.QtGui import QColor, QFont, QImage, QKeyEvent, QPainter, QPen, QPixmap, QPolygonF
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -57,6 +58,8 @@ class ImageView(QWidget):
         self._high_res_source: Path | None = None
         self._high_res_loader: ImageLoadWorker | None = None
         self._high_res_requested = False
+        self._high_res_level = 0
+        self._high_res_max_dimension = 0
         self.setMinimumSize(280, 360)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -70,6 +73,8 @@ class ImageView(QWidget):
         self._high_res_source = high_res_source
         self._high_res_requested = False
         self._high_res_loader = None
+        self._high_res_level = 0
+        self._high_res_max_dimension = max(self.source_size)
         self.reset_view()
         self.update()
 
@@ -82,13 +87,19 @@ class ImageView(QWidget):
         self.update()
 
     def request_high_res(self) -> None:
-        if self._high_res_source is None or self._high_res_requested or self._high_res_loader is not None:
+        if self._high_res_source is None or self._high_res_loader is not None:
             return
         if not self._high_res_source.exists():
             return
+        source_max = max(self.region_size)
+        target_max = min(source_max, max(8192, int(max(self.width(), self.height()) * self.zoom * 2.0)))
+        if self._high_res_requested and target_max <= self._high_res_max_dimension:
+            return
+        if target_max <= self._high_res_max_dimension:
+            return
         self._high_res_requested = True
         self.high_res_status.emit("正在异步载入高清原图…")
-        self._high_res_loader = ImageLoadWorker(self._high_res_source)
+        self._high_res_loader = ImageLoadWorker(self._high_res_source, target_max)
         self._high_res_loader.loaded.connect(self._high_res_loaded)
         self._high_res_loader.failed.connect(self._high_res_failed)
         self._high_res_loader.start()
@@ -100,6 +111,7 @@ class ImageView(QWidget):
             return
         self.pixmap = pixmap
         self.source_size = (pixmap.width(), pixmap.height())
+        self._high_res_max_dimension = max(self.source_size)
         self.high_res_status.emit(f"高清原图已载入（{pixmap.width()}×{pixmap.height()}）")
         self.update()
         self._high_res_loader = None
@@ -249,38 +261,32 @@ class ImageLoadWorker(QThread):
     loaded = Signal(QImage)
     failed = Signal(str)
 
-    def __init__(self, source: Path) -> None:
+    def __init__(self, source: Path, max_dimension: int = 8192) -> None:
         super().__init__()
         self.source = source
+        self.max_dimension = max(1024, max_dimension)
 
     def run(self) -> None:
-        qt_error = ""
         try:
-            reader = QImageReader(str(self.source))
-            reader.setAutoTransform(True)
-            image = reader.read()
-            if not image.isNull():
-                self.loaded.emit(image)
-                return
-            qt_error = reader.errorString() or "Qt 无法读取图像数据"
-        except Exception as exc:  # pragma: no cover - surfaced in the UI
-            qt_error = str(exc)
-        # Some large or compressed TIFFs pass canRead() but fail during Qt decode.
-        # Pillow is used as a background fallback and the copied bytes are owned
-        # by QImage, so the signal remains valid after this worker exits.
-        try:
-            with Image.open(self.source) as opened:
-                opened.load()
-                rgb = opened.convert("RGB")
-                width, height = rgb.size
-                raw = rgb.tobytes()
-                image = QImage(raw, width, height, width * 3, QImage.Format.Format_RGB888).copy()
-                rgb.close()
+            # Decode a bounded grayscale level. Loading an entire RGB TIFF can
+            # exceed Qt's 256 MB image allocation limit even on a worker thread.
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+                opened = Image.open(self.source)
+                source_max = max(opened.size)
+                reduce_factor = max(1, ceil(source_max / self.max_dimension))
+                gray = opened.reduce(reduce_factor) if reduce_factor > 1 else opened.copy()
+                gray = gray.convert("L")
+                width, height = gray.size
+                raw = gray.tobytes()
+                image = QImage(raw, width, height, width, QImage.Format.Format_Grayscale8).copy()
+                gray.close()
+                opened.close()
             if image.isNull():
-                raise RuntimeError("备用解码器生成空图像")
+                raise RuntimeError("高清原图生成空图像")
             self.loaded.emit(image)
         except Exception as exc:  # pragma: no cover - surfaced in the UI
-            self.failed.emit(f"Qt: {qt_error}; Pillow: {exc}")
+            self.failed.emit(str(exc))
 
 
 class ProcessWorker(QThread):
@@ -326,19 +332,21 @@ class ImportWorker(QThread):
     def run(self) -> None:
         try:
             self.progress.emit(10, "读取图片")
-            with Image.open(self.source) as opened:
-                width, height = opened.size
-                self.progress.emit(25, "保存原始文件")
-                shutil.copy2(self.source, self.destination)
-                self.progress.emit(45, "生成预览")
-                reduce_factor = max(1, ceil(max(width, height) / 2400))
-                preview = opened.reduce(reduce_factor) if reduce_factor > 1 else opened.copy()
-                preview = preview.convert("RGB")
-                self.progress.emit(75, "准备预览")
-                self.destination.parent.mkdir(exist_ok=True)
-                preview_path = self.destination.with_name(f"{self.destination.stem}_preview.jpg")
-                preview.save(preview_path, format="JPEG", quality=88, optimize=True)
-                preview.close()
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+                with Image.open(self.source) as opened:
+                    width, height = opened.size
+                    self.progress.emit(25, "保存原始文件")
+                    shutil.copy2(self.source, self.destination)
+                    self.progress.emit(45, "生成预览")
+                    reduce_factor = max(1, ceil(max(width, height) / 2400))
+                    preview = opened.reduce(reduce_factor) if reduce_factor > 1 else opened.copy()
+                    preview = preview.convert("RGB")
+                    self.progress.emit(75, "准备预览")
+                    self.destination.parent.mkdir(exist_ok=True)
+                    preview_path = self.destination.with_name(f"{self.destination.stem}_preview.jpg")
+                    preview.save(preview_path, format="JPEG", quality=88, optimize=True)
+                    preview.close()
             self.progress.emit(100, "导入完成")
             self.completed.emit(str(self.destination), str(preview_path), self.source.name, width, height)
         except Exception as exc:  # pragma: no cover - surfaced in the UI
@@ -567,6 +575,7 @@ class MainWindow(QMainWindow):
         self.result = None
         self.file_label.setText(original_name)
         self.original_view.set_image(self.preview_source, high_res_source=self.source)
+        self.original_view.set_coordinate_size(width, height)
         self.cleaned_view.pixmap = QPixmap()
         self.cleaned_view.update()
         self.process_button.setEnabled(True)
