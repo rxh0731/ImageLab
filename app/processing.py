@@ -80,12 +80,6 @@ def _clean_ink_mask(mask_arr: np.ndarray, width: int, height: int, mode: str) ->
     ink = np.where(mask_arr < 128, 255, 0).astype(np.uint8)
     if mode == "conservative":
         return ink
-    if mode == "balanced":
-        # A small detached stroke can be a legitimate calligraphic component
-        # (for example the dot in "時"). Do not run connected-component
-        # pruning in the balanced preset: every thresholded source pixel is
-        # eligible for source-pixel passthrough below.
-        return ink
     # Analyze huge masks at a bounded working size, then map the keep mask back
     # to the original grid. Final output pixels remain full resolution.
     analysis_scale = min(1.0, 3200.0 / max(width, height))
@@ -93,8 +87,30 @@ def _clean_ink_mask(mask_arr: np.ndarray, width: int, height: int, mode: str) ->
         analysis_size = (max(1, int(width * analysis_scale)), max(1, int(height * analysis_scale)))
         ink = cv2.resize(ink, analysis_size, interpolation=cv2.INTER_AREA)
         ink = np.where(ink > 96, 255, 0).astype(np.uint8)
-    # Keep the balanced path free of binary median erosion: thin and broken
-    # calligraphic strokes are more important than removing every speck.
+    if mode == "balanced":
+        # Background texture is often connected to a character by a faint
+        # line, so area-only filtering cannot separate it reliably. Keep the
+        # thick core of each stroke instead: small specks do not have enough
+        # distance from the background to form a core, while detached dots
+        # with a real stroke core remain eligible for source-pixel passthrough.
+        distance = cv2.distanceTransform((ink > 0).astype(np.uint8), cv2.DIST_L2, 5)
+        positive = distance[distance > 0]
+        if positive.size:
+            core_width = float(np.clip(np.percentile(positive, 50), 3.0, 12.0))
+        else:
+            core_width = 3.0
+        core = np.where(distance >= core_width, 255, 0).astype(np.uint8)
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(core, connectivity=8)
+        min_core_area = max(12, int(core.shape[0] * core.shape[1] * 0.0000002))
+        keep = np.zeros_like(core)
+        for index in range(1, count):
+            if int(stats[index, cv2.CC_STAT_AREA]) >= min_core_area:
+                keep[labels == index] = 255
+        if analysis_scale < 1.0:
+            keep = cv2.resize(keep, (width, height), interpolation=cv2.INTER_NEAREST)
+        return keep
+    # The strong path is allowed to use a light median cleanup after the
+    # conservative core selection above.
     if mode == "strong":
         ink = cv2.medianBlur(ink, 3)
     count, labels, stats, _ = cv2.connectedComponentsWithStats(ink, connectivity=8)
