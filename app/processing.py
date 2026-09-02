@@ -75,6 +75,37 @@ def _find_text_regions(mask: Image.Image, enhanced: Image.Image, max_size: int =
     return regions[:5000]
 
 
+def _clean_ink_mask(mask_arr: np.ndarray, width: int, height: int, mode: str) -> np.ndarray:
+    """Remove isolated salt-and-pepper texture without hard-cropping real strokes."""
+    ink = np.where(mask_arr < 128, 255, 0).astype(np.uint8)
+    if mode == "conservative":
+        return ink
+    # Analyze huge masks at a bounded working size, then map the keep mask back
+    # to the original grid. Final output pixels remain full resolution.
+    analysis_scale = min(1.0, 3200.0 / max(width, height))
+    if analysis_scale < 1.0:
+        analysis_size = (max(1, int(width * analysis_scale)), max(1, int(height * analysis_scale)))
+        ink = cv2.resize(ink, analysis_size, interpolation=cv2.INTER_AREA)
+        ink = np.where(ink > 96, 255, 0).astype(np.uint8)
+    # A small median pass is safer than a large morphological opening for fine
+    # calligraphy and removes single-pixel paper/stone texture.
+    median_size = 3 if mode == "balanced" else 5
+    ink = cv2.medianBlur(ink, median_size)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(ink, connectivity=8)
+    min_area = max(12, int(width * height * (0.00000045 if mode == "balanced" else 0.0000008)))
+    keep = np.zeros_like(ink)
+    for index in range(1, count):
+        area = int(stats[index, cv2.CC_STAT_AREA])
+        w = int(stats[index, cv2.CC_STAT_WIDTH])
+        h = int(stats[index, cv2.CC_STAT_HEIGHT])
+        # Long strokes are retained even when fragmented into a small area.
+        if area >= min_area or (max(w, h) >= 20 and area >= max(3, min_area // 4)):
+            keep[labels == index] = 255
+    if analysis_scale < 1.0:
+        keep = cv2.resize(keep, (width, height), interpolation=cv2.INTER_NEAREST)
+    return keep
+
+
 def process_image(
     source: Path,
     output_dir: Path,
@@ -123,6 +154,8 @@ def process_image(
         corrected_arr = cv2.convertScaleAbs(corrected_arr, alpha=255.0 / background_level)
     if preset.denoise_radius > 0:
         corrected_arr = cv2.GaussianBlur(corrected_arr, (0, 0), sigmaX=preset.denoise_radius, sigmaY=preset.denoise_radius)
+    if mode in {"balanced", "strong"}:
+        corrected_arr = cv2.medianBlur(corrected_arr, 3 if mode == "balanced" else 5)
     enhanced_arr = cv2.convertScaleAbs(corrected_arr, alpha=preset.contrast, beta=128.0 * (1.0 - preset.contrast))
     enhanced = Image.fromarray(enhanced_arr, mode="L")
     progress(62, "提取文字候选")
@@ -132,7 +165,16 @@ def process_image(
     mask_arr = np.asarray(enhanced, dtype=np.uint8)
     if keep_faint:
         threshold -= 9
-    text_arr = np.where(mask_arr < threshold, 35, 255).astype(np.uint8)
+    raw_mask = np.where(mask_arr < threshold, 35, 255).astype(np.uint8)
+    ink_mask = _clean_ink_mask(raw_mask, width, height, mode)
+    # In balanced/strong modes, make the displayed enhancement a true white
+    # background image. Keep grayscale values only where ink was retained.
+    if mode in {"balanced", "strong"}:
+        cleaned_display = np.where(ink_mask > 0, enhanced_arr, 255).astype(np.uint8)
+    else:
+        cleaned_display = enhanced_arr
+    enhanced = Image.fromarray(cleaned_display, mode="L")
+    text_arr = np.where(ink_mask > 0, 35, 255).astype(np.uint8)
     text_mask = Image.fromarray(text_arr, mode="L")
     alpha = ImageOps.invert(text_mask)
     transparent = Image.new("RGBA", enhanced.size, (38, 34, 26, 0))
