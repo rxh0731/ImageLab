@@ -143,7 +143,7 @@ def process_image(
     enhanced_path = output_dir / f"{stem}_enhanced.png"
     mask_path = output_dir / f"{stem}_text-mask.png"
     transparent_path = output_dir / f"{stem}_transparent.png"
-    preview_path = output_dir / f"{stem}_enhanced_preview.jpg"
+    preview_path = output_dir / f"{stem}_enhanced_preview.png"
     progress(78, "分析文字区域")
     regions = _find_text_regions(text_mask, enhanced)
     progress(90, "保存结果")
@@ -151,8 +151,8 @@ def process_image(
     text_mask.save(mask_path)
     transparent.save(transparent_path)
     preview = enhanced.copy()
-    preview.thumbnail((2400, 2400), Image.Resampling.LANCZOS)
-    preview.save(preview_path, format="JPEG", quality=90, optimize=True)
+    preview.thumbnail((6000, 6000), Image.Resampling.LANCZOS)
+    preview.save(preview_path, format="PNG", optimize=True)
     preview.close()
     return {
         "enhanced": enhanced_path.name,
