@@ -87,12 +87,12 @@ def _clean_ink_mask(mask_arr: np.ndarray, width: int, height: int, mode: str) ->
         analysis_size = (max(1, int(width * analysis_scale)), max(1, int(height * analysis_scale)))
         ink = cv2.resize(ink, analysis_size, interpolation=cv2.INTER_AREA)
         ink = np.where(ink > 96, 255, 0).astype(np.uint8)
-    # A small median pass is safer than a large morphological opening for fine
-    # calligraphy and removes single-pixel paper/stone texture.
-    median_size = 3 if mode == "balanced" else 5
-    ink = cv2.medianBlur(ink, median_size)
+    # Keep the balanced path free of binary median erosion: thin and broken
+    # calligraphic strokes are more important than removing every speck.
+    if mode == "strong":
+        ink = cv2.medianBlur(ink, 3)
     count, labels, stats, _ = cv2.connectedComponentsWithStats(ink, connectivity=8)
-    min_area = max(12, int(width * height * (0.00000045 if mode == "balanced" else 0.0000008)))
+    min_area = max(8, int(width * height * (0.00000010 if mode == "balanced" else 0.00000055)))
     keep = np.zeros_like(ink)
     for index in range(1, count):
         area = int(stats[index, cv2.CC_STAT_AREA])
@@ -154,8 +154,8 @@ def process_image(
         corrected_arr = cv2.convertScaleAbs(corrected_arr, alpha=255.0 / background_level)
     if preset.denoise_radius > 0:
         corrected_arr = cv2.GaussianBlur(corrected_arr, (0, 0), sigmaX=preset.denoise_radius, sigmaY=preset.denoise_radius)
-    if mode in {"balanced", "strong"}:
-        corrected_arr = cv2.medianBlur(corrected_arr, 3 if mode == "balanced" else 5)
+    if mode == "strong":
+        corrected_arr = cv2.medianBlur(corrected_arr, 3)
     enhanced_arr = cv2.convertScaleAbs(corrected_arr, alpha=preset.contrast, beta=128.0 * (1.0 - preset.contrast))
     enhanced = Image.fromarray(enhanced_arr, mode="L")
     progress(62, "提取文字候选")
@@ -165,6 +165,10 @@ def process_image(
     mask_arr = np.asarray(enhanced, dtype=np.uint8)
     if keep_faint:
         threshold -= 9
+    if mode == "balanced":
+        threshold += 10
+    elif mode == "strong":
+        threshold += 4
     raw_mask = np.where(mask_arr < threshold, 35, 255).astype(np.uint8)
     ink_mask = _clean_ink_mask(raw_mask, width, height, mode)
     # In balanced/strong modes, make the displayed enhancement a true white
