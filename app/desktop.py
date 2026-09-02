@@ -123,8 +123,13 @@ class ImageView(QWidget):
     def reset_view(self) -> None:
         self.zoom = 1.0
         self.pan = QPointF(0, 0)
+        self._space_down = False
         self._set_hand_cursor(False)
         self.update()
+
+    def set_space_pan_active(self, active: bool) -> None:
+        self._space_down = active
+        self._set_hand_cursor(self._panning)
 
     def _set_hand_cursor(self, dragging: bool) -> None:
         if dragging or self._space_down:
@@ -418,6 +423,11 @@ class MainWindow(QMainWindow):
     def eventFilter(self, watched, event) -> bool:  # noqa: N802
         if isinstance(event, QKeyEvent) and event.key() == Qt.Key.Key_Alt and not event.isAutoRepeat():
             self._alt_zoom_held = event.type() == QEvent.Type.KeyPress
+            return False
+        if isinstance(event, QKeyEvent) and event.key() == Qt.Key.Key_Space and not event.isAutoRepeat():
+            active = event.type() == QEvent.Type.KeyPress
+            self.original_view.set_space_pan_active(active)
+            self.cleaned_view.set_space_pan_active(active)
             return False
         if event.type() == QEvent.Type.Wheel and hasattr(event, "globalPosition"):
             alt_down = bool(QApplication.queryKeyboardModifiers() & Qt.KeyboardModifier.AltModifier)
