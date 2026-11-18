@@ -313,7 +313,21 @@ class ImageLoadWorker(QThread):
                 opened = Image.open(self.source)
                 source_max = max(opened.size)
                 reduce_factor = max(1, ceil(source_max / self.max_dimension))
-                gray = opened.reduce(reduce_factor) if reduce_factor > 1 else opened.copy()
+                if getattr(opened, "n_frames", 1) > 1:
+                    # The exported TIFF contains page 0 (white background)
+                    # and page 1 (transparent text). Composite both pages for
+                    # the high-resolution preview without creating another
+                    # user-facing output file.
+                    background = opened.convert("RGB")
+                    background = background.reduce(reduce_factor) if reduce_factor > 1 else background
+                    opened.seek(1)
+                    text_layer = opened.convert("RGBA")
+                    text_layer = text_layer.reduce(reduce_factor) if reduce_factor > 1 else text_layer
+                    gray = Image.alpha_composite(background.convert("RGBA"), text_layer).convert("L")
+                    background.close()
+                    text_layer.close()
+                else:
+                    gray = opened.reduce(reduce_factor) if reduce_factor > 1 else opened.copy()
                 gray = gray.convert("L")
                 width, height = gray.size
                 raw = gray.tobytes()
@@ -351,6 +365,7 @@ class ProcessWorker(QThread):
                 self.mode,
                 self.keep_faint,
                 params=self.params,
+                preview_dir=PREVIEW_CACHE / "processed" / self.source.stem,
                 progress_callback=lambda value, message: self.progress.emit(value, message),
             )
             result["job_id"] = job_id
@@ -464,6 +479,7 @@ class BatchWorker(QThread):
                         self.mode,
                         self.keep_faint,
                         params=self.params,
+                        preview_dir=PREVIEW_CACHE / "processed" / source.stem,
                         progress_callback=lambda value, message, name=source.name: self.item_progress.emit(value, f"{name}：{message}"),
                     )
                     succeeded += 1
@@ -861,13 +877,23 @@ class MainWindow(QMainWindow):
         if selected:
             self.output_root = Path(selected)
             self.output_dir_edit.setText(str(self.output_root))
+            self.refresh_file_list()
             self.batch_button.setEnabled(bool(self.files))
 
     def refresh_file_list(self) -> None:
         if not self.source_root:
             return
         iterator = self.source_root.rglob("*") if self.recursive_check.isChecked() else self.source_root.glob("*")
-        self.files = sorted((path for path in iterator if path.is_file() and path.suffix.lower() in SUPPORTED_SUFFIXES), key=lambda path: str(path).lower())
+        self.files = sorted(
+            (
+                path
+                for path in iterator
+                if path.is_file()
+                and path.suffix.lower() in SUPPORTED_SUFFIXES
+                and not (self.output_root and path.is_relative_to(self.output_root))
+            ),
+            key=lambda path: str(path).lower(),
+        )
         self.current_index = 0 if self.files else -1
         self._update_page_controls()
         if self.current_index >= 0:
@@ -976,7 +1002,7 @@ class MainWindow(QMainWindow):
         self.process_button.setEnabled(True)
         self.export_button.setEnabled(True)
         output_dir = Path(result["output_dir"])
-        cleaned_preview = output_dir / result.get("enhanced_preview", result["enhanced"])
+        cleaned_preview = Path(result.get("preview_path", result.get("enhanced_preview", output_dir / result["enhanced"])))
         cleaned_full = output_dir / result["enhanced"]
         self.cleaned_view.set_image(cleaned_preview, high_res_source=cleaned_full)
         self.cleaned_view.set_coordinate_size(result["width"], result["height"])
@@ -1087,13 +1113,21 @@ class MainWindow(QMainWindow):
         destination = self.output_root / relative_parent / self.source.stem
         destination.mkdir(parents=True, exist_ok=True)
         source_dir = Path(self.result["output_dir"])
-        names = [self.result.get("white_tif", self.result["enhanced"]), self.result.get("text_tif", self.result["transparent"]), self.result["text_mask"], self.result["enhanced_preview"]]
-        if self.result.get("white_preview"):
-            names.append(self.result["white_preview"])
-        for name in names:
-            source_file = source_dir / name
-            if source_file.exists():
-                shutil.copy2(source_file, destination / name)
+        name = self.result.get("layered_tif", self.result["enhanced"])
+        source_file = source_dir / name
+        if not source_file.exists():
+            QMessageBox.warning(self, "保存失败", "没有找到处理后的 TIFF 文件。")
+            return
+        for stale_name in (
+            f"{self.source.stem}_white.tif",
+            f"{self.source.stem}_text.tif",
+            f"{self.source.stem}_transparent.png",
+            f"{self.source.stem}_enhanced.png",
+            f"{self.source.stem}_text-mask.png",
+            f"{self.source.stem}_enhanced_preview.png",
+        ):
+            (destination / stale_name).unlink(missing_ok=True)
+        shutil.copy2(source_file, destination / f"{self.source.stem}.tif")
         self.current_saved = True
         self.status.setText(f"当前图片已保存到：{destination}")
 

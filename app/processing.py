@@ -197,6 +197,7 @@ def process_image(
     mode: str,
     keep_faint: bool,
     params: dict | None = None,
+    preview_dir: Path | None = None,
     progress_callback=None,
 ) -> dict:
     def progress(value: int, message: str) -> None:
@@ -282,30 +283,47 @@ def process_image(
 
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = source.stem
-    enhanced_path = output_dir / f"{stem}_white.tif"
-    white_png_path = output_dir / f"{stem}_white_preview.png"
-    mask_path = output_dir / f"{stem}_text-mask.png"
-    transparent_path = output_dir / f"{stem}_text.tif"
-    preview_path = output_dir / f"{stem}_enhanced_preview.png"
+    for stale_name in (
+        f"{stem}_white.tif",
+        f"{stem}_text.tif",
+        f"{stem}_transparent.png",
+        f"{stem}_enhanced.png",
+        f"{stem}_text-mask.png",
+        f"{stem}_enhanced_preview.png",
+    ):
+        (output_dir / stale_name).unlink(missing_ok=True)
+    layered_path = output_dir / f"{stem}.tif"
+    preview_root = preview_dir or (output_dir.parent / ".imagelab_previews" / output_dir.name)
+    preview_root.mkdir(parents=True, exist_ok=True)
+    mask_path = preview_root / f"{stem}_text-mask.png"
+    preview_path = preview_root / f"{stem}_preview.png"
     progress(78, "分析文字区域")
     regions = _find_text_regions(text_mask, enhanced)
     progress(90, "保存结果")
-    enhanced.save(enhanced_path, format="TIFF", compression="tiff_lzw")
+    # A single multipage TIFF stores the two requested layers in order:
+    # page 0 is an opaque white background and page 1 is the RGBA text layer.
+    # Pillow exposes these pages as TIFF IFDs; editors that support layered
+    # TIFFs can use them as the background and text layers respectively.
+    white_background = Image.new("RGB", original_size, (255, 255, 255))
+    white_background.save(
+        layered_path,
+        format="TIFF",
+        save_all=True,
+        append_images=[transparent],
+        compression="tiff_lzw",
+    )
     text_mask.save(mask_path)
-    transparent.save(transparent_path, format="TIFF", compression="tiff_lzw")
     preview = enhanced.copy()
     preview.thumbnail((6000, 6000), Image.Resampling.LANCZOS)
     preview.save(preview_path, format="PNG", optimize=True)
-    preview.save(white_png_path, format="PNG", optimize=True)
     preview.close()
     return {
-        "enhanced": enhanced_path.name,
-        "white_tif": enhanced_path.name,
-        "text_tif": transparent_path.name,
-        "white_preview": white_png_path.name,
-        "text_mask": mask_path.name,
-        "transparent": transparent_path.name,
-        "enhanced_preview": preview_path.name,
+        "enhanced": layered_path.name,
+        "layered_tif": layered_path.name,
+        "text_mask": str(mask_path),
+        "transparent": layered_path.name,
+        "enhanced_preview": str(preview_path),
+        "preview_path": str(preview_path),
         "width": enhanced.width,
         "height": enhanced.height,
         "original_width": original_size[0],
