@@ -77,11 +77,14 @@ def _find_text_regions(mask: Image.Image, enhanced: Image.Image, max_size: int =
 
 def _repair_stroke_density(ink: np.ndarray) -> np.ndarray:
     """Restore small holes inside retained strokes without filling glyph counters."""
+    # The raw threshold can leave narrow background-colored cuts inside a
+    # solid ink stroke. A single 9x9 closing bridges those cuts while keeping
+    # the larger counters of a glyph open.
     closed = cv2.morphologyEx(
         ink,
         cv2.MORPH_CLOSE,
-        np.ones((3, 3), dtype=np.uint8),
-        iterations=2,
+        np.ones((9, 9), dtype=np.uint8),
+        iterations=1,
     )
     contours, hierarchy = cv2.findContours(closed, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
     if hierarchy is None:
