@@ -34,47 +34,6 @@ def _normalize(gray: Image.Image) -> Image.Image:
     return Image.fromarray(out, mode="L")
 
 
-def _find_text_regions(mask: Image.Image, enhanced: Image.Image, max_size: int = 2400) -> list[dict]:
-    """Return editable candidate regions; never use these polygons to hard-crop pixels."""
-    full_width, full_height = mask.size
-    scale = min(1.0, max_size / max(full_width, full_height))
-    analysis_size = (max(1, int(full_width * scale)), max(1, int(full_height * scale)))
-    binary = np.asarray(mask.resize(analysis_size, Image.Resampling.BOX), dtype=np.uint8)
-    ink = np.where(binary < 128, 255, 0).astype(np.uint8)
-    height, width = ink.shape
-    kernel_size = max(1, int(round(min(width, height) / 1400)))
-    if kernel_size > 1:
-        kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
-        ink = cv2.morphologyEx(ink, cv2.MORPH_OPEN, kernel)
-    contours, _ = cv2.findContours(ink, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    gray = np.asarray(enhanced.resize(analysis_size, Image.Resampling.BOX), dtype=np.uint8)
-    min_area = max(12, int(width * height * 0.000002))
-    regions: list[dict] = []
-    for contour in contours:
-        area = float(cv2.contourArea(contour))
-        x, y, w, h = cv2.boundingRect(contour)
-        if area < min_area or w < 3 or h < 3:
-            continue
-        perimeter = cv2.arcLength(contour, True)
-        polygon = cv2.approxPolyDP(contour, max(1.0, perimeter * 0.02), True).reshape(-1, 2)
-        if len(polygon) < 3:
-            continue
-        region_mask = np.zeros_like(ink)
-        cv2.drawContours(region_mask, [contour], -1, 255, -1)
-        mean_darkness = float(255 - gray[region_mask > 0].mean()) if np.any(region_mask) else 0.0
-        confidence = round(float(np.clip(55 + mean_darkness * 0.55, 55, 99)), 1)
-        regions.append({
-            "id": len(regions) + 1,
-            "polygon": [[int(round(px / scale)), int(round(py / scale))] for px, py in polygon],
-            "bbox": [int(round(x / scale)), int(round(y / scale)), int(round(w / scale)), int(round(h / scale))],
-            "confidence": confidence,
-        })
-    regions.sort(key=lambda item: (item["bbox"][1], item["bbox"][0]))
-    for index, region in enumerate(regions, start=1):
-        region["id"] = index
-    return regions[:5000]
-
-
 def _repair_stroke_density(ink: np.ndarray) -> np.ndarray:
     """Restore small holes inside retained strokes without filling glyph counters."""
     # The raw threshold can leave narrow background-colored cuts inside a
@@ -225,10 +184,23 @@ def process_image(
         warnings.simplefilter("ignore", Image.DecompressionBombWarning)
         with Image.open(source) as opened:
             original_size = opened.size
+            source_dpi_info = opened.info.get("dpi")
             original_rgb = opened.convert("RGB").copy()
             original = ImageOps.grayscale(original_rgb)
     source_rgb_arr = np.asarray(original_rgb, dtype=np.uint8).copy()
-    scale = 1.0
+    source_dpi_x = 300.0
+    if isinstance(source_dpi_info, (tuple, list)) and source_dpi_info:
+        try:
+            source_dpi_x = float(source_dpi_info[0])
+        except (TypeError, ValueError):
+            source_dpi_x = 300.0
+    elif source_dpi_info is not None:
+        try:
+            source_dpi_x = float(source_dpi_info)
+        except (TypeError, ValueError):
+            source_dpi_x = 300.0
+    if not np.isfinite(source_dpi_x) or source_dpi_x <= 0:
+        source_dpi_x = 300.0
     progress(18, "规范化亮度")
     normalized = _normalize(original)
     norm_arr = np.asarray(normalized, dtype=np.uint8)
@@ -256,7 +228,7 @@ def process_image(
         corrected_arr = cv2.medianBlur(corrected_arr, 3)
     enhanced_arr = cv2.convertScaleAbs(corrected_arr, alpha=preset.contrast, beta=128.0 * (1.0 - preset.contrast))
     enhanced = Image.fromarray(enhanced_arr, mode="L")
-    progress(62, "提取文字候选")
+    progress(62, "生成文字保留掩膜")
 
     # Preserve faint strokes by using a conservative threshold and keeping the grayscale source.
     threshold = 128 + preset.threshold_bias
@@ -277,9 +249,7 @@ def process_image(
     # replaced by white or transparent pixels.
     retained = display_mask > 0
     cleaned_display = np.where(retained[..., None], source_rgb_arr, 255).astype(np.uint8)
-    enhanced = Image.fromarray(cleaned_display, mode="RGB")
-    text_arr = np.where(display_mask > 0, 35, 255).astype(np.uint8)
-    text_mask = Image.fromarray(text_arr, mode="L")
+    cleaned_display = Image.fromarray(cleaned_display, mode="RGB")
     alpha = Image.fromarray(np.where(retained, 255, 0).astype(np.uint8), mode="L")
     source_rgba = Image.fromarray(np.dstack((source_rgb_arr, np.asarray(alpha, dtype=np.uint8))), mode="RGBA")
     transparent = source_rgba
@@ -298,17 +268,24 @@ def process_image(
     layered_path = output_dir / f"{stem}.tif"
     preview_root = preview_dir or (output_dir.parent / ".imagelab_previews" / output_dir.name)
     preview_root.mkdir(parents=True, exist_ok=True)
-    mask_path = preview_root / f"{stem}_text-mask.png"
+    (preview_root / f"{stem}_text-mask.png").unlink(missing_ok=True)
     preview_path = preview_root / f"{stem}_preview.png"
-    progress(78, "分析文字区域")
-    regions = _find_text_regions(text_mask, enhanced)
-    progress(90, "保存结果")
-    # A single multipage TIFF stores the two requested layers in order:
-    # page 0 is an opaque white background and page 1 is the RGBA text layer.
-    # Pillow exposes these pages as TIFF IFDs; editors that support layered
-    # TIFFs can use them as the background and text layers respectively.
-    white_background = Image.new("RGB", original_size, (255, 255, 255))
-    white_background.save(
+    progress(76, "准备输出图层")
+    # The requested DPI controls the actual raster size. Missing source DPI is
+    # treated as 300 dpi so the default setting preserves the original pixels.
+    resize_factor = output_dpi / source_dpi_x
+    output_size = (
+        max(1, int(round(original_size[0] * resize_factor))),
+        max(1, int(round(original_size[1] * resize_factor))),
+    )
+    if output_size != original_size:
+        cleaned_display = cleaned_display.resize(output_size, Image.Resampling.LANCZOS)
+        transparent = transparent.resize(output_size, Image.Resampling.LANCZOS)
+    progress(90, "保存单个 TIFF 图层文件")
+    # Page 0 is an immediately visible white-background composite for ordinary
+    # image viewers. Page 1 is the transparent text layer, retaining source
+    # ink pixels and alpha outside the retained mask for layer-aware editors.
+    cleaned_display.save(
         layered_path,
         format="TIFF",
         save_all=True,
@@ -316,24 +293,22 @@ def process_image(
         compression="tiff_lzw",
         dpi=(output_dpi, output_dpi),
     )
-    text_mask.save(mask_path)
-    preview = enhanced.copy()
+    preview = cleaned_display.copy()
     preview.thumbnail((6000, 6000), Image.Resampling.LANCZOS)
     preview.save(preview_path, format="PNG", optimize=True)
     preview.close()
     return {
         "enhanced": layered_path.name,
         "layered_tif": layered_path.name,
-        "text_mask": str(mask_path),
         "transparent": layered_path.name,
         "enhanced_preview": str(preview_path),
         "preview_path": str(preview_path),
         "dpi": output_dpi,
-        "width": enhanced.width,
-        "height": enhanced.height,
+        "width": output_size[0],
+        "height": output_size[1],
         "original_width": original_size[0],
         "original_height": original_size[1],
-        "preview_scale": round(scale, 4),
+        "source_dpi": round(source_dpi_x, 4),
+        "resample_factor": round(resize_factor, 6),
         "confidence": round(min(99.0, 86.0 + (9.0 if keep_faint else 0.0)), 1),
-        "regions": regions,
     }

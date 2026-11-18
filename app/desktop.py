@@ -10,7 +10,7 @@ from pathlib import Path
 
 from PIL import Image
 from PySide6.QtCore import QEvent, QPointF, QRectF, QThread, QTimer, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QImage, QKeyEvent, QPainter, QPen, QPixmap, QPolygonF
+from PySide6.QtGui import QColor, QFont, QImage, QKeyEvent, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QDoubleSpinBox,
@@ -30,8 +30,6 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSpinBox,
     QSplitter,
-    QTableWidget,
-    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -61,11 +59,7 @@ class ImageView(QWidget):
         super().__init__(parent)
         self.title = title
         self.pixmap = QPixmap()
-        self.regions: list[dict] = []
         self.source_size = (1, 1)
-        self.region_size = (1, 1)
-        self.show_regions = False
-        self.selected_region: int | None = None
         self.zoom = 1.0
         self.pan = QPointF(0, 0)
         self._panning = False
@@ -85,7 +79,6 @@ class ImageView(QWidget):
         self.pixmap = QPixmap.fromImage(image) if not image.isNull() else QPixmap()
         if not self.pixmap.isNull():
             self.source_size = (self.pixmap.width(), self.pixmap.height())
-            self.region_size = self.source_size
         self._high_res_source = high_res_source
         self._high_res_requested = False
         self._high_res_loader = None
@@ -99,16 +92,11 @@ class ImageView(QWidget):
         self._high_res_source = None
         self._high_res_loader = None
         self.source_size = (1, 1)
-        self.region_size = (1, 1)
         self.reset_view()
         self.update()
 
-    def set_regions(self, regions: list[dict]) -> None:
-        self.regions = regions
-        self.update()
-
     def set_coordinate_size(self, width: int, height: int) -> None:
-        self.region_size = (max(1, width), max(1, height))
+        self.source_size = (max(1, width), max(1, height))
         self.update()
 
     def request_high_res(self) -> None:
@@ -116,7 +104,7 @@ class ImageView(QWidget):
             return
         if not self._high_res_source.exists():
             return
-        source_max = max(self.region_size)
+        source_max = max(self.source_size)
         target_max = min(source_max, max(8192, int(max(self.width(), self.height()) * self.zoom * 2.0)))
         if self._high_res_requested and target_max <= self._high_res_max_dimension:
             return
@@ -190,24 +178,6 @@ class ImageView(QWidget):
         x, y = rect.left(), rect.top()
         painter.setPen(QColor("#e6e9ed"))
         painter.drawText(int(x + 9), int(y + 18), self.title)
-        if not self.show_regions:
-            painter.setPen(QColor("#aab3bd"))
-            painter.drawText(12, self.height() - 12, f"缩放 {round(self.zoom * 100)}% · Alt+滚轮缩放 · 空格+拖动平移")
-            return
-        scale_x = rect.width() / self.region_size[0]
-        scale_y = rect.height() / self.region_size[1]
-        for region in self.regions[:500]:
-            points = [QPolygonF([QPointF(x + px * scale_x, y + py * scale_y) for px, py in region["polygon"]])]
-            if not points[0]:
-                continue
-            confidence = region.get("confidence", 100)
-            color = QColor("#b8793e" if confidence < 70 else "#a44a32")
-            if region["id"] == self.selected_region:
-                color = QColor("#2f6f5b")
-            pen = QPen(color, 3 if region["id"] == self.selected_region else 1.5)
-            painter.setPen(pen)
-            painter.setBrush(QColor(color.red(), color.green(), color.blue(), 25))
-            painter.drawPolygon(points[0])
         painter.setPen(QColor("#aab3bd"))
         painter.drawText(12, self.height() - 12, f"缩放 {round(self.zoom * 100)}% · Alt+滚轮缩放 · 空格+拖动平移")
 
@@ -314,10 +284,10 @@ class ImageLoadWorker(QThread):
                 source_max = max(opened.size)
                 reduce_factor = max(1, ceil(source_max / self.max_dimension))
                 if getattr(opened, "n_frames", 1) > 1:
-                    # The exported TIFF contains page 0 (white background)
-                    # and page 1 (transparent text). Composite both pages for
-                    # the high-resolution preview without creating another
-                    # user-facing output file.
+                    # The exported TIFF contains page 0 (visible white
+                    # background composite) and page 1 (transparent text).
+                    # Reading both pages keeps the preview correct for layer
+                    # aware editors without creating another user-facing file.
                     background = opened.convert("RGB")
                     background = background.reduce(reduce_factor) if reduce_factor > 1 else background
                     opened.seek(1)
@@ -530,8 +500,6 @@ class MainWindow(QMainWindow):
             QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox { min-height:34px; border:1px solid #46515d; border-radius:5px; padding:0 8px; background:#1c2229; color:#e6e9ed; }
             QComboBox QAbstractItemView { background:#252d36; color:#e6e9ed; selection-background-color:#a94f36; }
             QCheckBox { spacing:8px; color:#dce1e6; }
-            QTableWidget { background:#1c2229; color:#e6e9ed; border:1px solid #46515d; gridline-color:#303943; }
-            QHeaderView::section { padding:5px; background:#2b333d; border:0; color:#c4ccd5; font-size:11px; }
             QScrollArea { border:0; background:#222831; }
             QProgressBar { height:7px; border:0; border-radius:3px; background:#303943; color:#e6e9ed; }
             QProgressBar::chunk { border-radius:3px; background:#3d896f; }
@@ -644,10 +612,6 @@ class MainWindow(QMainWindow):
         self.reset_view_button = QPushButton("重置视图")
         self.reset_view_button.clicked.connect(self.reset_views)
         head.addWidget(self.reset_view_button)
-        self.regions_check = QCheckBox("显示文字区域")
-        self.regions_check.toggled.connect(self.toggle_regions)
-        self.regions_check.setEnabled(False)
-        head.addWidget(self.regions_check)
         layout.addLayout(head)
         self.preview_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.original_view = ImageView("原图")
@@ -755,13 +719,13 @@ class MainWindow(QMainWindow):
         self.output_dpi.setRange(72, 2400)
         self.output_dpi.setSingleStep(1)
         self.output_dpi.setSuffix(" dpi")
-        self.output_dpi.setToolTip("只设置 TIFF 的打印/排版分辨率元数据，不会重采样图像")
+        self.output_dpi.setToolTip("按此分辨率重新采样后写入 TIFF；默认 300 dpi")
         form.addRow("输出图片分辨率", self.output_dpi)
         layout.addLayout(form)
         self.keep_faint = QCheckBox("保留淡色笔画")
         self.keep_faint.setChecked(True)
         layout.addWidget(self.keep_faint)
-        note = QLabel("参数只用于判断文字区域。文字区域内的原图墨色和像素不会改变。")
+        note = QLabel("只去除背景；保留文字笔画的原图墨色和像素。输出 TIFF 含白底可见页与透明文字页。")
         note.setWordWrap(True)
         note.setObjectName("muted")
         layout.addWidget(note)
@@ -794,12 +758,7 @@ class MainWindow(QMainWindow):
         self.file_label = QLabel("尚未选择图片")
         self.file_label.setWordWrap(True)
         layout.addWidget(self.file_label)
-        self.region_table = QTableWidget(0, 2)
-        self.region_table.setHorizontalHeaderLabels(["区域", "置信度"])
-        self.region_table.setMaximumHeight(170)
-        self.region_table.cellClicked.connect(self.select_region)
-        layout.addWidget(QLabel("低置信度区域"))
-        layout.addWidget(self.region_table)
+
         layout.addStretch()
         scroll.setWidget(content)
         outer.addWidget(scroll)
@@ -940,9 +899,6 @@ class MainWindow(QMainWindow):
         self.preview_source = None
         self.original_view.clear_image()
         self.cleaned_view.clear_image()
-        self.region_table.setRowCount(0)
-        self.regions_check.setChecked(False)
-        self.regions_check.setEnabled(False)
         self.export_button.setEnabled(False)
         self.process_button.setEnabled(False)
         self.progress_bar.setValue(0)
@@ -1014,12 +970,8 @@ class MainWindow(QMainWindow):
         cleaned_full = output_dir / result["enhanced"]
         self.cleaned_view.set_image(cleaned_preview, high_res_source=cleaned_full)
         self.cleaned_view.set_coordinate_size(result["width"], result["height"])
-        self.cleaned_view.set_regions(result["regions"])
         self.original_view.set_coordinate_size(result["width"], result["height"])
-        self.original_view.set_regions(result["regions"])
-        self.regions_check.setEnabled(bool(result["regions"]))
         self.status.setText(f"处理完成：{result['width']}×{result['height']}，文字墨色保持原图像素")
-        self.populate_regions(result["regions"])
 
     def processing_failed(self, message: str) -> None:
         self.process_button.setEnabled(True)
@@ -1075,19 +1027,6 @@ class MainWindow(QMainWindow):
             self.batch_worker.request_cancel()
             self.status.setText("正在取消批量任务，当前文件完成后停止…")
 
-    def populate_regions(self, regions: list[dict]) -> None:
-        low = [r for r in regions if r.get("confidence", 100) < 70]
-        self.region_table.setRowCount(len(low))
-        for row, region in enumerate(low):
-            self.region_table.setItem(row, 0, QTableWidgetItem(f"区域 {region['id']}"))
-            self.region_table.setItem(row, 1, QTableWidgetItem(f"{region['confidence']}%"))
-
-    def toggle_regions(self, checked: bool) -> None:
-        self.original_view.show_regions = checked
-        self.cleaned_view.show_regions = checked
-        self.original_view.update()
-        self.cleaned_view.update()
-
     def reset_views(self) -> None:
         self._syncing_views = True
         try:
@@ -1095,20 +1034,6 @@ class MainWindow(QMainWindow):
             self.cleaned_view.set_view_state(self.original_view.zoom, self.original_view.pan)
         finally:
             self._syncing_views = False
-
-    def select_region(self, row: int, column: int) -> None:
-        if not self.result:
-            return
-        low = [r for r in self.result["regions"] if r.get("confidence", 100) < 70]
-        if row >= len(low):
-            return
-        region_id = low[row]["id"]
-        self.original_view.selected_region = region_id
-        self.cleaned_view.selected_region = region_id
-        self.regions_check.setChecked(True)
-        self.status.setText(f"已选中区域 {region_id}，请对照原图确认是否保留")
-        self.original_view.update()
-        self.cleaned_view.update()
 
     def save_current(self) -> None:
         if not self.result:
