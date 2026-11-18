@@ -75,11 +75,35 @@ def _find_text_regions(mask: Image.Image, enhanced: Image.Image, max_size: int =
     return regions[:5000]
 
 
+def _repair_stroke_density(ink: np.ndarray) -> np.ndarray:
+    """Restore small holes inside retained strokes without filling glyph counters."""
+    closed = cv2.morphologyEx(
+        ink,
+        cv2.MORPH_CLOSE,
+        np.ones((3, 3), dtype=np.uint8),
+        iterations=2,
+    )
+    contours, hierarchy = cv2.findContours(closed, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    if hierarchy is None:
+        return closed
+    for index, contour in enumerate(contours):
+        parent = int(hierarchy[0][index][3])
+        if parent < 0:
+            continue
+        hole_area = cv2.contourArea(contour)
+        parent_area = max(1.0, cv2.contourArea(contours[parent]))
+        # Small texture gaps inside a stroke are filled. Large enclosed glyph
+        # counters such as 口 remain open and continue to show the source.
+        if hole_area <= min(1500.0, max(64.0, parent_area * 0.08)):
+            cv2.drawContours(closed, [contour], -1, 255, thickness=cv2.FILLED)
+    return closed
+
+
 def _clean_ink_mask(mask_arr: np.ndarray, width: int, height: int, mode: str) -> np.ndarray:
     """Remove isolated salt-and-pepper texture without hard-cropping real strokes."""
     ink = np.where(mask_arr < 128, 255, 0).astype(np.uint8)
     if mode == "conservative":
-        return ink
+        return _repair_stroke_density(ink)
     # Analyze huge masks at a bounded working size, then map the keep mask back
     # to the original grid. Final output pixels remain full resolution.
     analysis_scale = min(1.0, 3200.0 / max(width, height))
@@ -127,7 +151,7 @@ def _clean_ink_mask(mask_arr: np.ndarray, width: int, height: int, mode: str) ->
                     keep[labels == index] = 255
         if analysis_scale < 1.0:
             keep = cv2.resize(keep, (width, height), interpolation=cv2.INTER_NEAREST)
-        return keep
+        return _repair_stroke_density(keep)
     # The strong path is allowed to use a light median cleanup after the
     # conservative core selection above.
     if mode == "strong":
@@ -144,7 +168,7 @@ def _clean_ink_mask(mask_arr: np.ndarray, width: int, height: int, mode: str) ->
             keep[labels == index] = 255
     if analysis_scale < 1.0:
         keep = cv2.resize(keep, (width, height), interpolation=cv2.INTER_NEAREST)
-    return keep
+    return _repair_stroke_density(keep)
 
 
 def _stroke_edge_band(ink_mask: np.ndarray, enhanced_arr: np.ndarray, threshold: int, mode: str) -> np.ndarray:

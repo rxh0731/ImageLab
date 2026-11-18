@@ -9,7 +9,7 @@ from math import ceil
 from pathlib import Path
 
 from PIL import Image
-from PySide6.QtCore import QEvent, QPointF, QRectF, QThread, Qt, Signal
+from PySide6.QtCore import QEvent, QPointF, QRectF, QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QImage, QKeyEvent, QPainter, QPen, QPixmap, QPolygonF
 from PySide6.QtWidgets import (
     QApplication,
@@ -179,19 +179,19 @@ class ImageView(QWidget):
 
     def paintEvent(self, event) -> None:  # noqa: N802
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor("#ebe7dc"))
+        painter.fillRect(self.rect(), QColor("#1c2229"))
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         if self.pixmap.isNull():
-            painter.setPen(QColor("#756f62"))
+            painter.setPen(QColor("#aab3bd"))
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "尚未导入图片")
             return
         rect = self._image_rect()
         painter.drawPixmap(rect.toRect(), self.pixmap)
         x, y = rect.left(), rect.top()
-        painter.setPen(QColor("#37342d"))
+        painter.setPen(QColor("#e6e9ed"))
         painter.drawText(int(x + 9), int(y + 18), self.title)
         if not self.show_regions:
-            painter.setPen(QColor("#756f62"))
+            painter.setPen(QColor("#aab3bd"))
             painter.drawText(12, self.height() - 12, f"缩放 {round(self.zoom * 100)}% · Alt+滚轮缩放 · 空格+拖动平移")
             return
         scale_x = rect.width() / self.region_size[0]
@@ -208,7 +208,7 @@ class ImageView(QWidget):
             painter.setPen(pen)
             painter.setBrush(QColor(color.red(), color.green(), color.blue(), 25))
             painter.drawPolygon(points[0])
-        painter.setPen(QColor("#756f62"))
+        painter.setPen(QColor("#aab3bd"))
         painter.drawText(12, self.height() - 12, f"缩放 {round(self.zoom * 100)}% · Alt+滚轮缩放 · 空格+拖动平移")
 
     def wheelEvent(self, event) -> None:  # noqa: N802
@@ -495,25 +495,30 @@ class MainWindow(QMainWindow):
         self._alt_zoom_held = False
         self._syncing_views = False
         self._templates: dict[str, dict] = {}
+        self._auto_process_after_preview = False
         self._build_ui()
         self._load_templates()
         QApplication.instance().installEventFilter(self)
 
     def _build_ui(self) -> None:
         self.setStyleSheet("""
-            QMainWindow, QWidget { background:#f6f4ed; color:#29271f; font-family:'Microsoft YaHei'; }
-            QFrame#panel { background:#fffefa; border:1px solid #dedbd1; border-radius:7px; }
-            QLabel#title { font-size:20px; font-weight:600; }
-            QLabel#muted { color:#716d61; font-size:12px; }
-            QPushButton { min-height:34px; padding:0 13px; border:1px solid #dedbd1; border-radius:6px; background:#fffefa; }
-            QPushButton:hover { border-color:#a44a32; color:#a44a32; }
-            QPushButton#primary { background:#a44a32; color:white; border-color:#a44a32; font-weight:600; }
-            QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox { min-height:34px; border:1px solid #dedbd1; border-radius:5px; padding:0 8px; background:#fffefa; }
-            QCheckBox { spacing:8px; }
-            QTableWidget { background:#fffefa; border:1px solid #dedbd1; gridline-color:#eeeae0; }
-            QHeaderView::section { padding:5px; background:#f0eee6; border:0; color:#716d61; font-size:11px; }
-            QProgressBar { height:7px; border:0; border-radius:3px; background:#e9e6dd; }
-            QProgressBar::chunk { border-radius:3px; background:#3e7662; }
+            QMainWindow, QWidget { background:#171b20; color:#e6e9ed; font-family:'Microsoft YaHei'; }
+            QFrame#panel { background:#222831; border:1px solid #39424d; border-radius:7px; }
+            QLabel#title { font-size:20px; font-weight:600; color:#f3f5f7; }
+            QLabel#muted { color:#aab3bd; font-size:12px; }
+            QPushButton { min-height:34px; padding:0 13px; border:1px solid #46515d; border-radius:6px; background:#2b333d; color:#e6e9ed; }
+            QPushButton:hover { border-color:#d07855; color:#f0b59d; background:#343e49; }
+            QPushButton:disabled { color:#6f7a86; border-color:#303943; background:#20262d; }
+            QPushButton#primary { background:#a94f36; color:white; border-color:#c46648; font-weight:600; }
+            QPushButton#primary:hover { background:#bd6044; }
+            QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox { min-height:34px; border:1px solid #46515d; border-radius:5px; padding:0 8px; background:#1c2229; color:#e6e9ed; }
+            QComboBox QAbstractItemView { background:#252d36; color:#e6e9ed; selection-background-color:#a94f36; }
+            QCheckBox { spacing:8px; color:#dce1e6; }
+            QTableWidget { background:#1c2229; color:#e6e9ed; border:1px solid #46515d; gridline-color:#303943; }
+            QHeaderView::section { padding:5px; background:#2b333d; border:0; color:#c4ccd5; font-size:11px; }
+            QScrollArea { border:0; background:#222831; }
+            QProgressBar { height:7px; border:0; border-radius:3px; background:#303943; color:#e6e9ed; }
+            QProgressBar::chunk { border-radius:3px; background:#3d896f; }
         """)
         root = QWidget()
         outer = QVBoxLayout(root)
@@ -886,6 +891,7 @@ class MainWindow(QMainWindow):
         target = self.current_index + offset
         if 0 <= target < len(self.files):
             self.current_index = target
+            self._auto_process_after_preview = True
             self._update_page_controls()
             self.load_current_file()
 
@@ -923,6 +929,12 @@ class MainWindow(QMainWindow):
         self.batch_button.setEnabled(bool(self.files and self.output_root))
         self.progress_bar.setValue(100)
         self.progress_label.setText(f"预览就绪：{width}×{height}")
+        if self._auto_process_after_preview:
+            self._auto_process_after_preview = False
+            if self.output_root:
+                self.status.setText("翻页完成，正在按当前模板自动处理…")
+                QTimer.singleShot(0, self.process)
+                return
         self.status.setText("可以处理当前图片，或使用自动批量处理目录")
 
     def preview_failed(self, message: str) -> None:
