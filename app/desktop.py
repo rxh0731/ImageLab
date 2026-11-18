@@ -47,9 +47,9 @@ PREVIEW_CACHE = ROOT / ".preview_cache"
 SUPPORTED_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
 
 DEFAULT_TEMPLATES = {
-    "拓印保守去背景": {"image_type": "rubbing", "mode": "conservative", "keep_faint": True, "background_radius": 31, "contrast": 1.28, "threshold_bias": 5, "denoise_radius": 0.65},
-    "古籍平衡去背景": {"image_type": "book", "mode": "balanced", "keep_faint": True, "background_radius": 41, "contrast": 1.18, "threshold_bias": 3, "denoise_radius": 0.8},
-    "手稿保守去背景": {"image_type": "manuscript", "mode": "conservative", "keep_faint": True, "background_radius": 25, "contrast": 1.10, "threshold_bias": -2, "denoise_radius": 0.35},
+    "拓印保守去背景": {"image_type": "rubbing", "mode": "conservative", "keep_faint": True, "background_radius": 31, "contrast": 1.28, "threshold_bias": 5, "denoise_radius": 0.65, "dpi": 300},
+    "古籍平衡去背景": {"image_type": "book", "mode": "balanced", "keep_faint": True, "background_radius": 41, "contrast": 1.18, "threshold_bias": 3, "denoise_radius": 0.8, "dpi": 300},
+    "手稿保守去背景": {"image_type": "manuscript", "mode": "conservative", "keep_faint": True, "background_radius": 25, "contrast": 1.10, "threshold_bias": -2, "denoise_radius": 0.35, "dpi": 300},
 }
 
 
@@ -751,6 +751,12 @@ class MainWindow(QMainWindow):
         self.denoise_radius.setSingleStep(0.05)
         self.denoise_radius.setDecimals(2)
         form.addRow("分析降噪半径", self.denoise_radius)
+        self.output_dpi = QSpinBox()
+        self.output_dpi.setRange(72, 2400)
+        self.output_dpi.setSingleStep(1)
+        self.output_dpi.setSuffix(" dpi")
+        self.output_dpi.setToolTip("只设置 TIFF 的打印/排版分辨率元数据，不会重采样图像")
+        form.addRow("输出图片分辨率", self.output_dpi)
         layout.addLayout(form)
         self.keep_faint = QCheckBox("保留淡色笔画")
         self.keep_faint.setChecked(True)
@@ -825,6 +831,7 @@ class MainWindow(QMainWindow):
             "contrast": self.contrast.value(),
             "threshold_bias": self.threshold_bias.value(),
             "denoise_radius": self.denoise_radius.value(),
+            "dpi": self.output_dpi.value(),
         }
 
     def apply_selected_template(self, name: str) -> None:
@@ -838,6 +845,7 @@ class MainWindow(QMainWindow):
         self.contrast.setValue(float(values.get("contrast", 1.15)))
         self.threshold_bias.setValue(int(values.get("threshold_bias", 0)))
         self.denoise_radius.setValue(float(values.get("denoise_radius", 0.55)))
+        self.output_dpi.setValue(int(values.get("dpi", 300)))
 
     def save_template(self) -> None:
         name = self.template_combo.currentText().strip()

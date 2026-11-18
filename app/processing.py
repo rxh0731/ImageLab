@@ -217,6 +217,9 @@ def process_image(
             int(params.get("threshold_bias", preset.threshold_bias)),
             max(0.0, min(4.0, float(params.get("denoise_radius", preset.denoise_radius)))),
         )
+    output_dpi = 300
+    if params and "dpi" in params:
+        output_dpi = max(72, min(2400, int(params["dpi"])))
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", Image.DecompressionBombWarning)
@@ -311,6 +314,7 @@ def process_image(
         save_all=True,
         append_images=[transparent],
         compression="tiff_lzw",
+        dpi=(output_dpi, output_dpi),
     )
     text_mask.save(mask_path)
     preview = enhanced.copy()
@@ -324,6 +328,7 @@ def process_image(
         "transparent": layered_path.name,
         "enhanced_preview": str(preview_path),
         "preview_path": str(preview_path),
+        "dpi": output_dpi,
         "width": enhanced.width,
         "height": enhanced.height,
         "original_width": original_size[0],
