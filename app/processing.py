@@ -169,6 +169,7 @@ def process_image(
     image_type: str,
     mode: str,
     keep_faint: bool,
+    params: dict | None = None,
     progress_callback=None,
 ) -> dict:
     def progress(value: int, message: str) -> None:
@@ -181,13 +182,22 @@ def process_image(
         preset = ProcessingPreset(preset.background_radius, preset.contrast + 0.10, preset.threshold_bias + 2, preset.denoise_radius + 0.2)
     elif mode == "strong":
         preset = ProcessingPreset(preset.background_radius + 10, preset.contrast + 0.18, preset.threshold_bias + 5, preset.denoise_radius + 0.5)
+    if params:
+        preset = ProcessingPreset(
+            max(3, int(params.get("background_radius", preset.background_radius))),
+            max(0.5, min(2.0, float(params.get("contrast", preset.contrast)))),
+            int(params.get("threshold_bias", preset.threshold_bias)),
+            max(0.0, min(4.0, float(params.get("denoise_radius", preset.denoise_radius)))),
+        )
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", Image.DecompressionBombWarning)
         with Image.open(source) as opened:
             original_size = opened.size
-            original = opened.convert("L").copy()
+            original_rgb = opened.convert("RGB").copy()
+            original = ImageOps.grayscale(original_rgb)
     source_arr = np.asarray(original, dtype=np.uint8).copy()
+    source_rgb_arr = np.asarray(original_rgb, dtype=np.uint8).copy()
     scale = 1.0
     progress(18, "规范化亮度")
     normalized = _normalize(original)
@@ -232,42 +242,41 @@ def process_image(
     raw_mask = np.where(mask_arr < threshold, 35, 255).astype(np.uint8)
     ink_mask = _clean_ink_mask(raw_mask, width, height, mode)
     display_mask = _stroke_edge_band(ink_mask, enhanced_arr, threshold, mode)
-    # In balanced/strong modes, make the displayed enhancement a true white
-    # background image. Keep grayscale values only where ink was retained.
-    # The final white-background output must not alter any selected stroke
-    # pixels. Copy the source grayscale byte-for-byte inside the conservative
-    # text mask and change only pixels outside that mask to white.
-    cleaned_display = np.where(display_mask > 0, source_arr, 255).astype(np.uint8)
-    enhanced = Image.fromarray(cleaned_display, mode="L")
+    # The output is a background removal operation. Every retained text pixel
+    # is copied from the original RGB source; only pixels outside the mask are
+    # replaced by white or transparent pixels.
+    retained = display_mask > 0
+    cleaned_display = np.where(retained[..., None], source_rgb_arr, 255).astype(np.uint8)
+    enhanced = Image.fromarray(cleaned_display, mode="RGB")
     text_arr = np.where(display_mask > 0, 35, 255).astype(np.uint8)
     text_mask = Image.fromarray(text_arr, mode="L")
-    # Use a grayscale alpha fringe so antialiased stroke edges remain smooth.
-    if mode in {"balanced", "strong"}:
-        alpha_arr = np.where(display_mask > 0, np.clip(255 - source_arr, 0, 255), 0).astype(np.uint8)
-        alpha = Image.fromarray(alpha_arr, mode="L")
-    else:
-        alpha = ImageOps.invert(text_mask)
-    source_rgba = Image.merge("RGBA", (original, original, original, alpha))
+    alpha = Image.fromarray(np.where(retained, 255, 0).astype(np.uint8), mode="L")
+    source_rgba = Image.fromarray(np.dstack((source_rgb_arr, np.asarray(alpha, dtype=np.uint8))), mode="RGBA")
     transparent = source_rgba
 
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = source.stem
-    enhanced_path = output_dir / f"{stem}_enhanced.png"
+    enhanced_path = output_dir / f"{stem}_white.tif"
+    white_png_path = output_dir / f"{stem}_white_preview.png"
     mask_path = output_dir / f"{stem}_text-mask.png"
-    transparent_path = output_dir / f"{stem}_transparent.png"
+    transparent_path = output_dir / f"{stem}_text.tif"
     preview_path = output_dir / f"{stem}_enhanced_preview.png"
     progress(78, "分析文字区域")
     regions = _find_text_regions(text_mask, enhanced)
     progress(90, "保存结果")
-    enhanced.save(enhanced_path)
+    enhanced.save(enhanced_path, format="TIFF", compression="tiff_lzw")
     text_mask.save(mask_path)
-    transparent.save(transparent_path)
+    transparent.save(transparent_path, format="TIFF", compression="tiff_lzw")
     preview = enhanced.copy()
     preview.thumbnail((6000, 6000), Image.Resampling.LANCZOS)
     preview.save(preview_path, format="PNG", optimize=True)
+    preview.save(white_png_path, format="PNG", optimize=True)
     preview.close()
     return {
         "enhanced": enhanced_path.name,
+        "white_tif": enhanced_path.name,
+        "text_tif": transparent_path.name,
+        "white_preview": white_png_path.name,
         "text_mask": mask_path.name,
         "transparent": transparent_path.name,
         "enhanced_preview": preview_path.name,
