@@ -196,7 +196,6 @@ def process_image(
             original_size = opened.size
             original_rgb = opened.convert("RGB").copy()
             original = ImageOps.grayscale(original_rgb)
-    source_arr = np.asarray(original, dtype=np.uint8).copy()
     source_rgb_arr = np.asarray(original_rgb, dtype=np.uint8).copy()
     scale = 1.0
     progress(18, "规范化亮度")
