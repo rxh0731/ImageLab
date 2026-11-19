@@ -5,3 +5,5 @@ Pillow>=11,<13
 numpy>=2.2,<3
 opencv-python-headless>=4.11,<5
 PySide6>=6.8,<7
+psd-tools>=1.27,<2
+tifffile>=2025.1,<2027
